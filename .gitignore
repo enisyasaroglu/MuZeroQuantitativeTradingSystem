@@ -1,2 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Data
+data/raw/
+data/processed/
+
+# OS
 .DS_Store
-Icon?
+
+# Environments
+.env
+.venv
