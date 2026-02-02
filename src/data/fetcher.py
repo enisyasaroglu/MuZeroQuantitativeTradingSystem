@@ -22,7 +22,7 @@ class DataFetcher:
         Downloads OHLCV data from Yahoo Finance.
 
         Args:
-            ticker_list (list): List of stock tickers (e.g., ['AAPL', 'MSFT']) or single index ['^GSPC']
+            ticker_list (list): List of stock tickers (e.g., ['AAPL', 'MSFT']) or single index ['^SPY']
             start_date (str): Start date in 'YYYY-MM-DD'
             end_date (str): End date in 'YYYY-MM-DD'
 

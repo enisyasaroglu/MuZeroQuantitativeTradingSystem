@@ -3,9 +3,9 @@ from dataclasses import dataclass
 @dataclass
 class ProjectConfig:
     # Data Settings
-    TICKER: str = "SPY"     # S&P 500
+    TICKER: str = "SPY"  # S&P 500
     START_DATE: str = "2015-01-01"
-    END_DATE: str = "2023-01-01"
+    END_DATE: str = "2023-01-01" 
     TRAIN_SPLIT: float = 0.8  # First 80% for training
     
     # Environment Settings
