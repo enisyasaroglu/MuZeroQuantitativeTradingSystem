@@ -1,5 +1,5 @@
 import torch.nn as nn
-from .shared import TimeSeriesEncoder
+from src.networks.shared import TimeSeriesEncoder
 
 class RepresentationNetwork(nn.Module):
     """

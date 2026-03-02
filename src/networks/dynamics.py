@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from .shared import MLP
+from src.networks.shared import MLP
 
 class DynamicsNetwork(nn.Module):
     """
