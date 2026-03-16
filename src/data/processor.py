@@ -53,7 +53,6 @@ class DataProcessor:
         # Fill NaNs created by rolling windows (e.g., first 30 days of RSI will be NaN)
         df = df.dropna()
         df = df.reset_index(drop=True)
-        df = df.iloc[config.LOOKBACK_WINDOW:]  # Ensure we have enough data after indicators
         print(f"Data shape after feature engineering: {df.shape}")
         return df
 

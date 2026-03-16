@@ -1,5 +1,5 @@
 import torch.nn as nn
-from src.networks.shared import MLP
+from .shared import MLP
 
 class PredictionNetwork(nn.Module):
     """
