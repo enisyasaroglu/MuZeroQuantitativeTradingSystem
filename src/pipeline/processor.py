@@ -115,7 +115,7 @@ class DataProcessor:
 
 if __name__ == "__main__":
     # Integration Test: Run Fetcher -> Processor
-    from src.data.fetcher import DataFetcher
+    from src.pipeline.fetcher import DataFetcher
     
     # 1. Fetch
     fetcher = DataFetcher()
