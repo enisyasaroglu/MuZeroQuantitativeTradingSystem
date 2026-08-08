@@ -88,7 +88,7 @@ def run_muzero():
             # Train for K epochs on the buffer
             for _ in range(10): 
                 batch = buffer.sample_batch()
-                loss = agent.update(batch, k_steps=5)
+                loss, loss_components = agent.update(batch, k_steps=5)
         
         print(f"Episode {episode} | Reward: {total_reward:.4f} | Loss: {loss:.4f} | Steps: {step_count}")
         

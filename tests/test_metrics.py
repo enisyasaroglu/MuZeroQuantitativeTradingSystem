@@ -17,6 +17,9 @@ assert abs(tr - 0.30) < 1e-9
 flat = [100000 * (1.0001 ** i) for i in range(50)]
 print('sharpe (near-constant growth):', sharpe_ratio(flat))
 
+# Edge Inputs
+# TO DO: Test metric functions with zero-return series, flat prices, or extreme single-day crashes to ensure division by zero does not yield NaN or Inf.
+
 # random walk sanity
 np.random.seed(1)
 rw = [100000]
