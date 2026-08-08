@@ -38,8 +38,13 @@ class DynamicsNetwork(nn.Module):
         
         next_hidden_state = self.dynamics_mlp(x)
         reward = self.reward_mlp(x)
-        
-        # In MuZero, we often normalize the hidden state to keep values stable
-        # Using simple min-max or L2 norm is common. 
-        # For now, we leave it raw, but we might add Tanh later if unstable.
+
+        # Bound the imagined next state the same way the representation
+        # network bounds its output (tanh, [-1, 1]). Both are consumed as
+        # "hidden_state" interchangeably by the prediction network and by
+        # further dynamics calls during MCTS, so they must share a scale --
+        # otherwise imagined states drift further out of range with every
+        # additional MCTS simulation step or unroll step.
+        next_hidden_state = torch.tanh(next_hidden_state)
+
         return next_hidden_state, reward

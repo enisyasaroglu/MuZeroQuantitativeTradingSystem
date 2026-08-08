@@ -38,8 +38,17 @@ class MLP(AbstractNetwork):
 
 class TimeSeriesEncoder(AbstractNetwork):
     """
-    The 'Eyes' of the agent. 
+    The 'Eyes' of the agent.
     Encodes the rolling window of market data into a compact hidden state.
+
+    The output is passed through tanh, bounding every latent state to
+    [-1, 1]. This matters specifically because this hidden state is reused
+    repeatedly as input to the dynamics network across MCTS simulations
+    and across the K-step unrolled training loop -- without a bound, its
+    scale can drift step over step, and since the dynamics network's own
+    output becomes the next step's input, that drift compounds. Bounding
+    keeps every hidden state (whether it came from the representation
+    network or was "imagined" by the dynamics network) on the same scale.
     """
     def __init__(self, input_features, hidden_size, num_layers=2, use_lstm=True):
         super().__init__()
@@ -65,6 +74,6 @@ class TimeSeriesEncoder(AbstractNetwork):
         # x shape: (Batch, Lookback, Features)
         # RNN Output: (Batch, Lookback, Hidden_Size)
         output, _ = self.rnn(x)
-        
-        # We take the state at the LAST time step to represent the current market condition
-        return output[:, -1, :]
+
+        # Take the state at the LAST time step, bounded to [-1, 1].
+        return torch.tanh(output[:, -1, :])

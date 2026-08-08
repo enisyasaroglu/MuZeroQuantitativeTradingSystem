@@ -2,84 +2,101 @@ import pandas as pd
 import numpy as np
 import torch
 import os
-from configs.base_config import config
-from src.env.trading_env import StockTradingEnv
-from src.agents.baselines.ppo_agent import PPOAgent
+import sys
 
-def train():
-    # 1. Load Processed Data
+from configs.muzero_config import MuZeroConfig
+from src.env.trading_env import StockTradingEnv
+from src.agents.muzero.muzero_agent import MuZeroAgent
+from src.utils.replay_buffer import ReplayBuffer
+
+def run_muzero():
+    # 1. Setup
+    config = MuZeroConfig()
+    
+    # Load Data
     data_path = os.path.join('data', 'processed', 'train_data.csv')
     if not os.path.exists(data_path):
-        print("Error: train_data.csv not found. Please run src/data/processor.py first.")
+        print("Data not found!")
         return
-
-    print(f"Loading data from {data_path}...")
     df = pd.read_csv(data_path)
     
-    # 2. Initialize Environment and Agent
     env = StockTradingEnv(df)
+    obs_shape = env.observation_space.shape # (60, 11)
     
-    # Obs shape: (60, 11), Action dim: 3
-    agent = PPOAgent(
-        obs_shape=env.observation_space.shape,
-        action_dim=env.action_space.n,
-        lr=0.0003,      # Learning Rate
-        gamma=0.99,     # Discount Factor
-        K_epochs=4      # Update repeats per batch
+    agent = MuZeroAgent(config, obs_shape)
+    
+    # Replay Buffer
+    buffer = ReplayBuffer(
+        capacity=500, 
+        batch_size=config.batch_size, 
+        unroll_steps=5, 
+        discount=config.discount_factor
     )
     
-    # 3. Training Loop Settings
-    num_episodes = 50  # Start small for testing
-    print(f"Starting training for {num_episodes} episodes...")
+    print(f"Starting MuZero Training on {config.stock_symbol}...")
+    print(f"Device: {agent.network.device}")
+    
+    num_episodes = 20 # Start small, MCTS is slow!
     
     for episode in range(1, num_episodes + 1):
-        state, info = env.reset()
+        obs, _ = env.reset()
+        done = False
+        total_reward = 0
         
-        # Memory storage for this episode
-        memory = {
-            'states': [],
+        # Temp storage for current episode
+        game_history = {
+            'obs': [],
             'actions': [],
-            'log_probs': [],
             'rewards': [],
-            'dones': []
+            'policies': [],
+            'values': []
         }
         
-        total_reward = 0
-        done = False
+        step_count = 0
         
-        # --- Run One Episode ---
         while not done:
-            # A. Select Action
-            action, log_prob, val = agent.select_action(state)
+            # A. MCTS Planning
+            # This is the slow part!
+            action, policy, value = agent.select_action(obs)
             
-            # B. Execute Step
-            next_state, reward, terminated, truncated, info = env.step(action)
+            # B. Execute
+            next_obs, reward, terminated, truncated, _ = env.step(action)
             done = terminated or truncated
             
-            # C. Store in Memory
-            memory['states'].append(state)
-            memory['actions'].append(action)
-            memory['log_probs'].append(log_prob)
-            memory['rewards'].append(reward)
-            memory['dones'].append(done)
+            # C. Store Data
+            game_history['obs'].append(obs)
+            game_history['actions'].append(action)
+            game_history['rewards'].append(reward)
+            game_history['policies'].append(policy)
+            game_history['values'].append(value)
             
-            # D. Move to next state
-            state = next_state
+            obs = next_obs
             total_reward += reward
+            step_count += 1
             
-        # --- Update Agent (Learning) ---
-        # We update the network using the data collected in this episode
-        loss = agent.update(memory)
+            # Optional: Print progress every 100 steps
+            # if step_count % 100 == 0:
+            #     print(f"Step {step_count} | Value: {value:.3f}")
+
+        # End of Episode
+        buffer.save_game(game_history)
         
-        # --- Logging ---
-        # Print progress every episode
-        print(f"Episode {episode}/{num_episodes} | Total Reward: {total_reward:.4f} | Loss: {loss:.4f}")
+        # D. Training Step
+        # Only train if we have enough data
+        loss = 0
+        if buffer.size() >= config.batch_size:
+            # Train for K epochs on the buffer
+            for _ in range(10): 
+                batch = buffer.sample_batch()
+                loss, loss_components = agent.update(batch, k_steps=5)
         
-        # Save the model periodically
-        if episode % 10 == 0:
-            save_path = os.path.join('src', 'models', f'ppo_checkpoint_{episode}.pth')
-            torch.save(agent.policy.state_dict(), save_path)
-            print(f"Model saved to {save_path}")
+        print(f"Episode {episode} | Reward: {total_reward:.4f} | Loss: {loss:.4f} | Steps: {step_count}")
+        
+        # Save Model
+        if episode % 5 == 0:
+            save_path = os.path.join('src', 'models', f'muzero_checkpoint_{episode}.pth')
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            torch.save(agent.network.state_dict(), save_path)
 
 if __name__ == "__main__":
-    train()
+    run_muzero()
