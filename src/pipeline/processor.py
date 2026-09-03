@@ -233,7 +233,7 @@ class DataProcessor:
 
 
 if __name__ == "__main__":
-    from src.pipeline.fetcher import DataFetcher
+    from src.pipeline.data_fetcher import DataFetcher
 
     start_time = time.time()
     console.print(Panel("[bold white]STAGE 2 · FEATURE ENGINEERING[/bold white]",
