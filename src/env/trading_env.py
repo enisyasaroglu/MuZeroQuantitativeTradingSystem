@@ -41,8 +41,14 @@ class StockTradingEnv(gym.Env):
         # Action Space: 0=Short, 1=Neutral, 2=Long
         self.action_space = spaces.Discrete(3)
 
-        # Observation Space: (Lookback Window, Number of Features)
-        self.feature_cols = [c for c in df.columns if c not in ['date', 'tic']]
+        # Observation feature set EXCLUDES raw 'log_return' -- that column
+        # must stay unnormalised for portfolio compounding (see step()
+        # below), while the observation needs every feature on a
+        # comparable, roughly mean-0/std-1 scale. 'log_return_norm'
+        # (added by DataProcessor.normalize()) is used in the observation
+        # instead. Mirrors the same fix in multi_asset_env.py's
+        # feature_cols.
+        self.feature_cols = [c for c in df.columns if c not in ['date', 'tic', 'log_return']]
         self.n_features = len(self.feature_cols)
         self.lookback = config.LOOKBACK_WINDOW
 
