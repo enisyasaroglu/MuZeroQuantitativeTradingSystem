@@ -26,6 +26,8 @@ Two uses in this repo:
 
 import numpy as np
 
+from src.portfolio.portfolio import OptimizationResult
+
 
 class PSOPortfolioOptimizer:
     def __init__(self, n_particles: int = 50, n_iterations: int = 100,
@@ -73,18 +75,34 @@ class PSOPortfolioOptimizer:
         port_std = np.sqrt(max(port_variance, 1e-12))
         return (port_return - self.risk_free_rate) / port_std
 
-    def optimize(self, expected_returns: np.ndarray, cov_matrix: np.ndarray) -> np.ndarray:
+    def optimize(self, expected_returns: np.ndarray, cov_matrix: np.ndarray,
+                 constraints=None) -> np.ndarray:
         """
-        Returns a weight vector (summing to 1, all >= 0) maximising the
-        Sharpe Ratio implied by `expected_returns` and `cov_matrix`.
+        Returns a weight vector maximising the Sharpe Ratio implied by
+        `expected_returns` and `cov_matrix`.
+
+        constraints: optional PortfolioConstraints (src/portfolio/constraints.py).
+        When None (default), behaviour is UNCHANGED from before this
+        parameter existed -- every projection step uses the original
+        _project_to_simplex, so every existing caller (MultiAssetTradingEnv,
+        rolling_rebalance_weights) gets bit-identical output. When
+        provided, each iteration's projection step uses
+        constraints.project() instead, so cardinality/bound constraints
+        are respected THROUGHOUT the search, not just applied to the
+        final answer afterward -- projecting only the final gbest_position
+        would let particles converge under the wrong constraint set and
+        then get force-repaired once, which typically destroys the
+        fitness value that was actually optimised for.
         """
         expected_returns = np.asarray(expected_returns, dtype=np.float64)
         cov_matrix = np.asarray(cov_matrix, dtype=np.float64)
         n_assets = len(expected_returns)
 
+        project = constraints.project if constraints is not None else self._project_to_simplex
+
         # Initialise particles uniformly on the simplex-ish region, then project.
         positions = self.rng.uniform(0, 1, size=(self.n_particles, n_assets))
-        positions = np.array([self._project_to_simplex(p) for p in positions])
+        positions = np.array([project(p) for p in positions])
         velocities = self.rng.uniform(-0.1, 0.1, size=(self.n_particles, n_assets))
 
         pbest_positions = positions.copy()
@@ -107,7 +125,7 @@ class PSOPortfolioOptimizer:
             )
             velocities = np.clip(velocities, -self.v_max, self.v_max)
             positions = positions + velocities
-            positions = np.array([self._project_to_simplex(p) for p in positions])
+            positions = np.array([project(p) for p in positions])
 
             scores = np.array([
                 self._sharpe_fitness(p, expected_returns, cov_matrix) for p in positions
@@ -151,3 +169,30 @@ class PSOPortfolioOptimizer:
             weights_over_time[t] = current_weights
 
         return weights_over_time
+
+
+class PSOOptimizerAdapter:
+    """
+    Thin adapter making PSOPortfolioOptimizer satisfy
+    PortfolioOptimizerProtocol (src/portfolio/portfolio.py), for use with
+    the Portfolio class. PSOPortfolioOptimizer itself keeps its original
+    (expected_returns, cov_matrix) -> weights call shape unchanged --
+    every existing caller (MultiAssetTradingEnv, rolling_rebalance_weights)
+    keeps working exactly as before. This adapter is additive.
+    """
+
+    def __init__(self, pso: "PSOPortfolioOptimizer" = None, **pso_kwargs):
+        self._pso = pso or PSOPortfolioOptimizer(**pso_kwargs)
+
+    def optimize(self, inputs, constraints) -> OptimizationResult:
+        if inputs.expected_returns is None or inputs.cov_matrix is None:
+            raise ValueError("PSOOptimizerAdapter requires expected_returns and cov_matrix in OptimizationInputs.")
+
+        weights = self._pso.optimize(inputs.expected_returns, inputs.cov_matrix, constraints=constraints)
+
+        return OptimizationResult(
+            weights=weights,
+            method_name="PSO",
+            converged=True,  # "ran its full iteration budget" -- see OptimizationResult's own docstring
+            diagnostics={"n_particles": self._pso.n_particles, "n_iterations": self._pso.n_iterations},
+        )

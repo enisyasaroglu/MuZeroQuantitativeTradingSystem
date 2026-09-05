@@ -13,9 +13,12 @@ templates as the action space:
     0: All-cash (no exposure)
     1: Equal-weight across all assets
     2..N-1: One "single-asset long" template per asset (concentrated bet)
-    N: PSO-optimal allocation (recomputed periodically from trailing
-       returns via PSOPortfolioOptimizer -- bridges the Swarm Intelligence
-       project's PSO implementation into this system)
+    N: The portfolio optimizer's allocation (recomputed periodically from
+       trailing returns via a Portfolio instance -- see src/portfolio/
+       portfolio.py). Defaults to PSO (bridges the Swarm Intelligence
+       project's PSO implementation into this system), but this
+       environment now accepts ANY optimizer satisfying
+       PortfolioOptimizerProtocol -- it is no longer PSO-specific.
 
 This keeps the action space discrete and small, so the EXISTING MuZero
 architecture (discrete action embeddings, standard closed-form MCTS
@@ -24,6 +27,13 @@ action-embedding layer in dynamics.py. A genuinely continuous-weight
 version (arbitrary points on the simplex, searched via progressive
 widening) is a natural next step and is noted in the README as future
 work, not claimed as implemented here.
+
+REBALANCE CADENCE/CACHING: previously implemented inline here
+(_current_pso_template/_pso_template_cache). Now delegated entirely to
+Portfolio (src/portfolio/portfolio.py), so this logic exists in exactly
+one place -- an environment for method #2 (Mean-Variance, HRP, ...)
+reuses the same Portfolio class rather than reimplementing this pattern
+a second time.
 """
 
 import gymnasium as gym
@@ -35,7 +45,9 @@ import os
 sys.path.append(os.path.join(os.path.dirname(__file__), '../../'))
 from configs.base_config import config
 from src.env.rewards import DifferentialSharpeRatio
-from portfolio.methods.pso_optimizer import PSOPortfolioOptimizer
+from src.portfolio.constraints import PortfolioConstraints
+from src.portfolio.portfolio import Portfolio, PortfolioOptimizerProtocol
+from src.portfolio.methods.pso_optimizer import PSOOptimizerAdapter
 
 
 class MultiAssetTradingEnv(gym.Env):
@@ -54,13 +66,22 @@ class MultiAssetTradingEnv(gym.Env):
 
     metadata = {'render_modes': ['human']}
 
-    def __init__(self, df, use_dsr=None, pso_rebalance_every=20, pso_lookback=60):
+    def __init__(self, df, use_dsr=None, optimizer: PortfolioOptimizerProtocol = None,
+                 constraints: PortfolioConstraints = None,
+                 rebalance_every: int = 20, lookback_window: int = 60):
+        """
+        optimizer: any PortfolioOptimizerProtocol-conforming method.
+            Defaults to PSO (via PSOOptimizerAdapter) if not provided --
+            preserves this environment's previous default behaviour.
+        constraints: PortfolioConstraints applied to the optimizer's
+            search. Defaults to PortfolioConstraints() (long-only,
+            full-investment, no cardinality limit) if not provided --
+            matches the original _project_to_simplex behaviour exactly.
+        """
         super().__init__()
         self.tickers = sorted(df['tic'].unique())
         self.n_assets = len(self.tickers)
         self.lookback = config.LOOKBACK_WINDOW
-        self.pso_rebalance_every = pso_rebalance_every
-        self.pso_lookback = pso_lookback
 
         # Observation feature set EXCLUDES raw 'log_return': it must stay
         # unnormalised for portfolio P&L (see _pivot_raw_returns below),
@@ -85,12 +106,12 @@ class MultiAssetTradingEnv(gym.Env):
         self.panel = np.stack([pivoted[c] for c in self.feature_cols], axis=-1).astype(np.float32)
 
         # SEPARATE panel of RAW log-returns, used only for portfolio P&L
-        # and for PSO's expected-return/covariance estimation -- both need
-        # true return magnitudes, not z-scored ones (z-scoring a return
-        # series removes exactly the mean-return signal that
-        # PSOPortfolioOptimizer's Sharpe-ratio fitness needs to be
-        # meaningful, on top of the exp()-compounding blow-up risk this
-        # caused in the single-asset environment).
+        # and for the optimizer's expected-return/covariance estimation --
+        # both need true return magnitudes, not z-scored ones (z-scoring
+        # a return series removes exactly the mean-return signal that a
+        # Sharpe-ratio fitness needs to be meaningful, on top of the
+        # exp()-compounding blow-up risk this caused in the single-asset
+        # environment).
         raw_return_wide = df.pivot(index='date', columns='tic', values='log_return')[self.tickers]
         self.raw_returns = raw_return_wide.values.astype(np.float32)  # (n_dates, n_assets)
 
@@ -102,7 +123,8 @@ class MultiAssetTradingEnv(gym.Env):
         assert not np.isnan(self.raw_returns).any(), "NaN detected in raw_returns after pivot -- check for missing (date, ticker) rows."
 
         # Action menu: cash, equal-weight, one concentrated template per
-        # asset, and a PSO-optimal template (recomputed periodically).
+        # asset, and the optimizer's template (recomputed periodically via
+        # self.portfolio, a Portfolio instance -- see src/portfolio/portfolio.py).
         self.action_templates = self._build_static_templates()
         self.action_space = spaces.Discrete(self.n_actions)
 
@@ -116,13 +138,23 @@ class MultiAssetTradingEnv(gym.Env):
         self.dsr = DifferentialSharpeRatio(
             eta=config.DSR_ETA, warmup_steps=config.DSR_WARMUP_STEPS, clip=config.DSR_CLIP,
         )
-        self._pso = PSOPortfolioOptimizer(n_particles=30, n_iterations=40)
+
+        # Rebalance cadence/caching now owned entirely by Portfolio, not
+        # reimplemented here. Defaults reproduce this environment's
+        # previous PSO-specific behaviour exactly if no optimizer/
+        # constraints are supplied.
+        self.portfolio = Portfolio(
+            n_assets=self.n_assets,
+            optimizer=optimizer or PSOOptimizerAdapter(n_particles=30, n_iterations=40),
+            constraints=constraints or PortfolioConstraints(),
+            rebalance_every=rebalance_every,
+            lookback=lookback_window,
+        )
 
         self.current_step = 0
         self.current_weights = None
         self.portfolio_value = config.INITIAL_CAPITAL
         self.portfolio_history = [config.INITIAL_CAPITAL]
-        self._pso_template_cache = None
 
     def _build_static_templates(self):
         templates = [np.zeros(self.n_assets)]  # 0: all-cash
@@ -131,35 +163,19 @@ class MultiAssetTradingEnv(gym.Env):
             w = np.zeros(self.n_assets)
             w[i] = 1.0
             templates.append(w)
-        return templates  # PSO template appended dynamically per-episode at index len(templates)
-
-    def _current_pso_template(self, t):
-        """
-        Recomputes the PSO-optimal template every `pso_rebalance_every`
-        steps using the trailing `pso_lookback` window of RAW realised
-        log-returns (self.raw_returns, not the observation panel --
-        see __init__). Cached between rebalances so MCTS simulations
-        don't re-run PSO every call.
-        """
-        if t < self.pso_lookback:
-            return np.full(self.n_assets, 1.0 / self.n_assets)
-
-        if self._pso_template_cache is None or (t - self.pso_lookback) % self.pso_rebalance_every == 0:
-            window = self.raw_returns[t - self.pso_lookback:t]  # (lookback, n_assets)
-            expected_returns = window.mean(axis=0)
-            cov_matrix = np.cov(window, rowvar=False)
-            self._pso_template_cache = self._pso.optimize(expected_returns, cov_matrix)
-
-        return self._pso_template_cache
+        return templates  # optimizer's template appended dynamically per-episode at index len(templates)
 
     def _get_action_weights(self, action, t):
         if action < len(self.action_templates):
             return self.action_templates[action]
-        return self._current_pso_template(t)  # the PSO template slot
+        # The optimizer's template slot: Portfolio owns rebalance timing
+        # and caching, so this environment doesn't decide "is it time to
+        # re-optimise" itself anymore.
+        return self.portfolio.propose_weights(t, self.raw_returns)
 
     @property
     def n_actions(self):
-        return len(self.action_templates) + 1  # +1 for the dynamic PSO template
+        return len(self.action_templates) + 1  # +1 for the optimizer's template
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
@@ -168,7 +184,7 @@ class MultiAssetTradingEnv(gym.Env):
         self.portfolio_value = config.INITIAL_CAPITAL
         self.portfolio_history = [config.INITIAL_CAPITAL]
         self.dsr.reset()
-        self._pso_template_cache = None
+        self.portfolio.reset()
         return self._get_observation(), {}
 
     def step(self, action):
@@ -184,7 +200,11 @@ class MultiAssetTradingEnv(gym.Env):
         # Transaction cost proportional to total turnover (L1 distance
         # between old and new weights) -- a natural multi-asset
         # generalisation of the single-asset "cost only on position
-        # change" rule.
+        # change" rule. Computed against the ENVIRONMENT's current_weights
+        # (not self.portfolio.current_weights) because the action menu's
+        # static templates (cash/equal-weight/concentrated) can also be
+        # chosen -- turnover must reflect a switch AWAY FROM those too,
+        # not just switches between successive optimizer allocations.
         turnover = np.abs(target_weights - self.current_weights).sum()
         cost = config.TRANSACTION_FEE * turnover
         net_return = gross_return - cost
@@ -195,6 +215,11 @@ class MultiAssetTradingEnv(gym.Env):
         reward = self.dsr.step(net_return) if self.use_dsr else net_return
 
         self.current_weights = target_weights
+        # Keep Portfolio's own current_weights in sync too, in case a
+        # future optimizer method's fitness function wants to read it
+        # (e.g. a turnover-penalised variant) -- see Portfolio's own
+        # docstring on why current-state-awareness is opt-in, not default.
+        self.portfolio.commit(target_weights)
         self.current_step += 1
 
         return self._get_observation(), reward, terminated, False, {
