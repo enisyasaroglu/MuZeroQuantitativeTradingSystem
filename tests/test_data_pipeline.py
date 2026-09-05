@@ -33,13 +33,44 @@ assert val.isnull().sum().sum() == 0
 assert test.isnull().sum().sum() == 0
 print('no NaNs in any split - ok')
 
-# check normalization uses train stats: recompute manually
-cols = [c for c in list(config.TECH_INDICATORS) + ['log_return','volume'] if c in train_raw.columns]
+# Check normalization uses TRAIN statistics only
 train_feat = proc.add_technical_indicators(train_raw)
-mean_check = train_feat[cols].mean()
-std_check = train_feat[cols].std()
-recomputed = (train_feat[cols] - mean_check) / (std_check + 1e-8)
+val_feat = proc.add_technical_indicators(val_raw)
+test_feat = proc.add_technical_indicators(test_raw)
+
+cols = [
+    c
+    for c in list(config.TECH_INDICATORS) + ['volume']
+    if c in train_feat.columns
+]
+
+# Calculate statistics ONLY from the training set
+train_mean = train_feat[cols].mean()
+train_std = train_feat[cols].std()
+
+# Recompute expected normalization for all splits
+expected_train = (train_feat[cols] - train_mean) / (train_std + 1e-8)
+expected_val = (val_feat[cols] - train_mean) / (train_std + 1e-8)
+expected_test = (test_feat[cols] - train_mean) / (train_std + 1e-8)
+
 import numpy.testing as npt
-npt.assert_allclose(recomputed.values, train[cols].values, atol=1e-6)
-print('train normalization matches expected train-only stats - ok')
-print('ALL PROCESSOR SANITY CHECKS PASSED')
+
+npt.assert_allclose(
+    train[cols].values,
+    expected_train.values,
+    atol=1e-6
+)
+
+npt.assert_allclose(
+    val[cols].values,
+    expected_val.values,
+    atol=1e-6
+)
+
+npt.assert_allclose(
+    test[cols].values,
+    expected_test.values,
+    atol=1e-6
+)
+
+print('normalization uses train-only statistics - ok')

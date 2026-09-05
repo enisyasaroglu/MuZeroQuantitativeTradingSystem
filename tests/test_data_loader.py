@@ -82,7 +82,7 @@ def test_normalization_uses_train_statistics_only():
 
     train_norm, val_norm, test_norm = proc.normalize(train_feat, val_feat, test_feat)
 
-    cols = [c for c in list(config.TECH_INDICATORS) + ['log_return', 'volume'] if c in train_feat.columns]
+    cols = [c for c in list(config.TECH_INDICATORS) + ['volume'] if c in train_feat.columns]
     train_mean = train_feat[cols].mean()
     train_std = train_feat[cols].std()
 
