@@ -24,8 +24,18 @@ must then recover market_weights exactly, since MVO's closed-form
 solution w*=(1/lambda)*Sigma^-1*mu with mu=lambda*Sigma@w reduces
 algebraically to w. If either property fails, the prior/posterior math
 has a bug -- see tests/test_black_litterman.py.
+
+BlackLittermanOptimizerAdapter (below) IS a PortfolioOptimizerProtocol
+member: it chains this estimator to MeanVarianceOptimizer, optionally
+using a view_generator (e.g. MomentumViewGenerator,
+src/portfolio/methods/momentum_views.py) to populate P/Q/omega from
+returns_sample. This is what makes Black-Litterman actually usable by
+Portfolio/MultiAssetTradingEnv, which expect the Protocol shape.
 """
 import numpy as np
+
+from src.portfolio.portfolio import OptimizationResult, OptimizationInputs
+from src.portfolio.methods.mean_variance import MeanVarianceOptimizer
 
 
 class BlackLittermanEstimator:
@@ -82,3 +92,61 @@ class BlackLittermanEstimator:
         posterior_cov = sigma + precision_inv
 
         return posterior_returns, posterior_cov
+
+
+class BlackLittermanOptimizerAdapter:
+    """
+    PortfolioOptimizerProtocol member: chains BlackLittermanEstimator
+    (equilibrium prior + optional view-blending) and MeanVarianceOptimizer
+    (posterior returns -> weights) into the standard institutional
+    Black-Litterman -> Mean-Variance pipeline.
+
+    view_generator: any object with .generate_views(returns_sample) ->
+        (P, Q, omega), e.g. MomentumViewGenerator. Defaults to None --
+        with no view generator, this degenerates EXACTLY to the zero-view
+        case already proven correct in tests/test_black_litterman.py
+        (posterior = prior, weights = market_weights). That equivalence
+        is itself checked as a regression guard in
+        tests/test_black_litterman_adapter.py: if it ever breaks while
+        test_black_litterman.py's own tests still pass, the bug is in
+        this adapter's chaining, not the underlying math.
+    """
+
+    def __init__(self, view_generator=None, risk_aversion: float = 1.0, tau: float = 0.025,
+                 market_weights: np.ndarray = None):
+        self.view_generator = view_generator
+        self.risk_aversion = risk_aversion
+        self._bl = BlackLittermanEstimator(risk_aversion=risk_aversion, tau=tau)
+        self._mvo = MeanVarianceOptimizer(risk_aversion=risk_aversion)
+        self.market_weights = market_weights  # None -> BlackLittermanEstimator's own equal-weight proxy
+
+    def optimize(self, inputs, constraints) -> OptimizationResult:
+        if inputs.cov_matrix is None:
+            raise ValueError("BlackLittermanOptimizerAdapter requires cov_matrix in OptimizationInputs.")
+
+        cov_matrix = np.asarray(inputs.cov_matrix, dtype=np.float64)
+
+        P = Q = omega = None
+        if self.view_generator is not None:
+            if inputs.returns_sample is None:
+                raise ValueError(
+                    "BlackLittermanOptimizerAdapter's view_generator requires "
+                    "returns_sample in OptimizationInputs."
+                )
+            P, Q, omega = self.view_generator.generate_views(inputs.returns_sample)
+
+        posterior_returns, posterior_cov = self._bl.estimate(
+            cov_matrix, market_weights=self.market_weights, P=P, Q=Q, omega=omega
+        )
+
+        mvo_result = self._mvo.optimize(
+            OptimizationInputs(expected_returns=posterior_returns, cov_matrix=posterior_cov),
+            constraints,
+        )
+
+        return OptimizationResult(
+            weights=mvo_result.weights,
+            method_name="BlackLitterman" if self.view_generator is None else "BlackLitterman+Momentum",
+            converged=mvo_result.converged,
+            diagnostics={"had_views": self.view_generator is not None},
+        )

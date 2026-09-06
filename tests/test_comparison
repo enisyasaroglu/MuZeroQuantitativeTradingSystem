@@ -1,0 +1,73 @@
+import sys, os
+sys.path.append(os.path.join(os.path.dirname(__file__), '../'))
+import numpy as np
+from src.portfolio.comparison import MethodSpec, run_backtest, compare_methods
+from src.portfolio.constraints import PortfolioConstraints
+from src.portfolio.methods.equal_weight import EqualWeightOptimizer
+from src.portfolio.methods.pso_optimizer import PSOPortfolioOptimizer, PSOOptimizerAdapter
+
+
+def _synthetic_returns(n_dates=200, n_assets=3, seed=0):
+    return np.random.RandomState(seed).normal(0.0005, 0.01, size=(n_dates, n_assets))
+
+
+def test_run_backtest_returns_correct_length_history():
+    returns = _synthetic_returns()
+    history = run_backtest(returns, EqualWeightOptimizer(), PortfolioConstraints(),
+                           rebalance_every=20, lookback=60, transaction_fee=0.001, initial_capital=100000.0)
+    assert len(history) == len(returns) - 60 + 1
+    assert history[0] == 100000.0
+
+
+def test_run_backtest_matches_manual_compounding():
+    """Hand-checkable case: equal weight, zero transaction cost, no
+    rebalancing -- should compound EXACTLY the equal-weighted return
+    series, verifying exp(net_return) is applied correctly here, not
+    just asserted to be."""
+    returns = _synthetic_returns(n_dates=100, n_assets=2, seed=1)
+    history = run_backtest(returns, EqualWeightOptimizer(), PortfolioConstraints(),
+                           rebalance_every=1000, lookback=60, transaction_fee=0.0, initial_capital=1.0)
+
+    expected = 1.0
+    for t in range(60, 100):
+        port_return = 0.5 * returns[t, 0] + 0.5 * returns[t, 1]
+        expected *= np.exp(port_return)
+    assert np.isclose(history[-1], expected, rtol=1e-6)
+
+
+def test_deterministic_method_has_single_run_no_plus_minus():
+    returns = _synthetic_returns()
+    specs = [MethodSpec("EqualWeight", lambda seed: EqualWeightOptimizer())]
+    summary, raw = compare_methods(returns, specs, rebalance_every=20, lookback=60)
+
+    row = summary.iloc[0]
+    assert row["Runs"] == 1
+    assert "\u00b1" not in row["sharpe_ratio"]
+    assert len(raw["EqualWeight"]) == 1
+
+
+def test_stochastic_method_reports_multiple_runs_with_spread():
+    returns = _synthetic_returns()
+    specs = [MethodSpec(
+        "PSO",
+        lambda seed: PSOOptimizerAdapter(pso=PSOPortfolioOptimizer(n_particles=10, n_iterations=10, random_state=seed)),
+        stochastic=True, n_runs=3,
+    )]
+    summary, raw = compare_methods(returns, specs, rebalance_every=20, lookback=60)
+
+    row = summary.iloc[0]
+    assert row["Runs"] == 3
+    assert "\u00b1" in row["sharpe_ratio"]
+    assert len(raw["PSO"]) == 3
+
+
+def test_identical_method_and_data_gives_identical_results():
+    """No accidental shared mutable state between methods within one
+    compare_methods() call."""
+    returns = _synthetic_returns(seed=5)
+    specs = [
+        MethodSpec("A", lambda seed: EqualWeightOptimizer()),
+        MethodSpec("B", lambda seed: EqualWeightOptimizer()),
+    ]
+    summary, raw = compare_methods(returns, specs, rebalance_every=20, lookback=60)
+    assert raw["A"][0]["total_return"] == raw["B"][0]["total_return"]
