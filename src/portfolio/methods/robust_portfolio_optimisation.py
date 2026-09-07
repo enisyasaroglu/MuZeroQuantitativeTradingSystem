@@ -28,11 +28,19 @@ the actual method used going forward).
    that sensitivity. This is the project's CORE robust method going
    forward.
 
-Both are independent, usable on their own -- this file does NOT chain
-them together (e.g. applying the box-uncertainty shrinkage inside each
-resample) since that would conflate two distinct, separately-motivated
-robust techniques into one, undocumented hybrid. Combining them
-deliberately is a reasonable future step, not assumed here.
+3. BoxUncertaintyOptimizerAdapter -- IS a PortfolioOptimizerProtocol
+   member, added so BoxUncertaintyEstimator can actually participate in
+   a Protocol-based method comparison (src/portfolio/comparison.py),
+   the same reason BlackLittermanOptimizerAdapter exists for
+   BlackLittermanEstimator. Chains: shrink expected returns via
+   BoxUncertaintyEstimator, then solve Mean-Variance on the SHRUNK
+   returns (not the raw sample mean).
+
+Both (1) and (2) are independent, usable on their own -- this file does
+NOT chain them together (e.g. applying the box-uncertainty shrinkage
+inside each resample) since that would conflate two distinct,
+separately-motivated robust techniques into one, undocumented hybrid.
+Combining them deliberately is a reasonable future step, not assumed here.
 
 DOCUMENTED SIMPLIFICATIONS (both honest, both explicit, matching this
 project's practice elsewhere -- e.g. PSO's rolling_rebalance_weights):
@@ -150,4 +158,33 @@ class RobustPortfolioOptimizer:
             method_name="RobustResampled",
             converged=True,
             diagnostics={"n_resamples": self.n_resamples},
+        )
+
+
+class BoxUncertaintyOptimizerAdapter:
+    """
+    PortfolioOptimizerProtocol member wrapping BoxUncertaintyEstimator +
+    MeanVarianceOptimizer -- see module docstring, item 3.
+    """
+
+    def __init__(self, confidence_level: float = 0.95, risk_aversion: float = 1.0):
+        self._shrinker = BoxUncertaintyEstimator(confidence_level=confidence_level)
+        self._mvo = MeanVarianceOptimizer(risk_aversion=risk_aversion)
+
+    def optimize(self, inputs, constraints) -> OptimizationResult:
+        if inputs.returns_sample is None:
+            raise ValueError("BoxUncertaintyOptimizerAdapter requires returns_sample in OptimizationInputs.")
+        if inputs.cov_matrix is None:
+            raise ValueError("BoxUncertaintyOptimizerAdapter requires cov_matrix in OptimizationInputs.")
+
+        shrunk_returns = self._shrinker.shrink_returns(inputs.returns_sample)
+        mvo_result = self._mvo.optimize(
+            OptimizationInputs(expected_returns=shrunk_returns, cov_matrix=inputs.cov_matrix),
+            constraints,
+        )
+        return OptimizationResult(
+            weights=mvo_result.weights,
+            method_name="RobustBoxUncertainty",
+            converged=mvo_result.converged,
+            diagnostics={},
         )
