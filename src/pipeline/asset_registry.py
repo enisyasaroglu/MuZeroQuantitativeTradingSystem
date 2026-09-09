@@ -33,13 +33,22 @@ class Asset:
 
 UNIVERSE = [
     Asset("^GSPC", "S&P 500 Index", AssetClass.INDEX),
-    Asset("SPY", "SPDR S&P 500 ETF", AssetClass.ETF),
-    Asset("QQQ", "Invesco QQQ (Nasdaq-100)", AssetClass.ETF),
     Asset("GLD", "SPDR Gold Shares", AssetClass.COMMODITY),
+    Asset("SLV", "iShares Silver Trust", AssetClass.COMMODITY),
+    Asset("USO", "United States Oil Fund", AssetClass.COMMODITY),
+    Asset("SPY", "SPDR S&P 500 ETF", AssetClass.ETF),
+    Asset("QQQ", "Invesco QQQ (Nasdaq-100)", AssetClass.ETF),    
     Asset("AAPL", "Apple Inc.", AssetClass.EQUITY),
     Asset("MSFT", "Microsoft Corporation", AssetClass.EQUITY),
     Asset("AMZN", "Amazon.com, Inc.", AssetClass.EQUITY),
     Asset("GOOGL", "Alphabet Inc. (Class A)", AssetClass.EQUITY),
+]
+
+""" # TODO: add more assets
+    Asset("^IXIC", "Nasdaq Composite Index", AssetClass.INDEX),
+    Asset("^DJI", "Dow Jones Industrial Average", AssetClass.INDEX),
+    Asset("^RUT", "Russell 2000 Index", AssetClass.INDEX),
+    Asset("^VIX", "CBOE Volatility Index", AssetClass.INDEX),
     Asset("TSLA", "Tesla, Inc.", AssetClass.EQUITY),
     Asset("BRK-B", "Berkshire Hathaway Inc. (Class B)", AssetClass.EQUITY),
     Asset("NVDA", "NVIDIA Corporation", AssetClass.EQUITY),
@@ -89,9 +98,7 @@ UNIVERSE = [
     Asset("JD", "JD.com, Inc.", AssetClass.EQUITY),
     Asset("BIDU", "Baidu, Inc.", AssetClass.EQUITY),
     Asset("TCEHY", "Tencent Holdings Limited", AssetClass.EQUITY),
-    Asset("NTES", "NetEase, Inc.", AssetClass.EQUITY),
-]
-
+    Asset("NTES", "NetEase, Inc.", AssetClass.EQUITY),"""
 
 def get_universe(asset_class: AssetClass = None) -> list:
     """Full universe, or filtered to one asset class."""

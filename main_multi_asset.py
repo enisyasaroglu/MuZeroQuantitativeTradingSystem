@@ -40,7 +40,18 @@ def load_multi_asset_split(split="train"):
 
 def train_muzero(num_episodes=20):
     df = load_multi_asset_split("train")
-    env = MultiAssetTradingEnv(df)
+
+    # use_dsr=False: with DSR active, this environment's reward has the
+    # SAME property already proven (mathematically, then empirically via
+    # a completed 500-episode run) to make "do nothing" strictly dominant
+    # once the running-average return goes negative -- whenever A < 0,
+    # a net_return of ~0 scores better than continuing to trade, with no
+    # downside risk, regardless of whether standing aside is actually the
+    # right call. In this environment, action 0 (all-cash) is that same
+    # "do nothing" escape hatch. This is the identical reward mechanism
+    # already fixed in main_muzero.py, not a new hypothesis -- applying
+    # the same established fix here rather than re-testing it.
+    env = MultiAssetTradingEnv(df, use_dsr=False)
 
     config = MuZeroConfig()
     config.action_space_dim = env.n_actions  # only change needed vs. single-asset training
@@ -49,12 +60,6 @@ def train_muzero(num_episodes=20):
     buffer = ReplayBuffer(capacity=500, batch_size=config.batch_size,
                            unroll_steps=config.unroll_steps, discount=config.discount_factor)
 
-    # QuantRLLogger, not RLLogger -- utils/dashboard_logger.py only defines
-    # QuantRLLogger; the previous import target doesn't exist there,
-    # and the call pattern below now matches its real interface
-    # (start_dashboard()/log_cycle()/stop_dashboard(), as already used
-    # correctly in main_muzero.py and main_ppo.py) instead of the
-    # undefined log_episode()/print_table()/print_summary() methods.
     logger = QuantRLLogger(
         agent_name="MuZero",
         asset_symbol=f"Multi-Asset ({env.n_assets})",
@@ -68,9 +73,6 @@ def train_muzero(num_episodes=20):
         temperature = temperature_schedule(episode, num_episodes)
         game_history = {'obs': [], 'actions': [], 'rewards': [], 'policies': [], 'values': []}
 
-        # QuantRLLogger.log_cycle needs the full portfolio/return trajectory
-        # (it computes PnL/Sharpe/drawdown/win-rate internally), so these
-        # are now tracked here the same way main_muzero.py already does.
         portfolio_history = [getattr(env, 'portfolio_value', 10000.0)]
         daily_returns = []
 
@@ -161,10 +163,21 @@ def train_ppo(num_episodes=50):
 
             state = next_state
 
+        # PPOAgent.update() returns (policy_loss, value_loss, entropy) --
+        # a 3-tuple, since the fix that made Value Loss actually reflect
+        # the critic's real training signal. The previous len==2-only
+        # check here fell through to float(update_result) on every real
+        # call, which raises TypeError on a 3-element tuple. Matches the
+        # exhaustive unpacking already used in main_ppo.py.
         update_result = agent.update(memory)
-        if isinstance(update_result, tuple) and len(update_result) == 2:
-            policy_loss, _ = update_result
-            value_loss = 0.0
+        if isinstance(update_result, tuple):
+            if len(update_result) == 3:
+                policy_loss, value_loss, _ = update_result
+            elif len(update_result) == 2:
+                policy_loss, _ = update_result
+                value_loss = 0.0
+            else:
+                policy_loss, value_loss = update_result[0], update_result[1]
         else:
             policy_loss, value_loss = float(update_result), 0.0
 

@@ -42,15 +42,16 @@ class DataFetcher:
         full_path = os.path.join(self.save_path, file_name)
 
         if verbose:
+            console.print(Panel("[bold white]STAGE 1 · DATA ACQUISITION[/bold white]",
+                                box=box.ROUNDED, expand=False, border_style="cyan"))
             header = Table.grid(padding=(0, 2))
             header.add_column(style="bold cyan")
             header.add_column(style="white")
             header.add_row("Target Tickers", str(ticker_list))
             header.add_row("Date Range", f"{start_date}  →  {end_date}")
             header.add_row("Destination", full_path)
-            console.print(Panel(header, title="[bold white]STAGE 1 · DATA ACQUISITION[/bold white]",
-                                 box=box.ROUNDED, expand=False, border_style="cyan"))
-
+            console.print(Panel(header, box=box.ROUNDED, expand=False, border_style="cyan"))
+            
         if os.path.exists(full_path):
             df = pd.read_csv(full_path, parse_dates=["date"])
             if verbose:
@@ -122,13 +123,28 @@ class DataFetcher:
 
 
 if __name__ == "__main__":
+    import argparse
+    from src.pipeline.asset_registry import AssetClass, get_tickers
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--multi-asset", action="store_true",
+                         help="Fetch the full asset registry universe instead of the single config.TICKER.")
+    parser.add_argument("--asset-class", type=str, default=None,
+                         help="Optional filter, e.g. equity/etf/commodity/index. Only used with --multi-asset.")
+    args = parser.parse_args()
+
     fetcher = DataFetcher()
-    data = fetcher.fetch_data(
-        ticker_list=[config.TICKER],
-        start_date=config.START_DATE,
-        end_date=config.END_DATE,
-        verbose=True
-    )
+
+    if args.multi_asset:
+        asset_class = AssetClass(args.asset_class) if args.asset_class else None
+        data, report = fetcher.fetch_universe(asset_class=asset_class, verbose=True)
+    else:
+        data = fetcher.fetch_data(
+            ticker_list=[config.TICKER],
+            start_date=config.START_DATE,
+            end_date=config.END_DATE,
+            verbose=True
+        )
 
     if data is not None:
         preview = Table(box=box.ROUNDED, header_style="bold blue", title="Preview")

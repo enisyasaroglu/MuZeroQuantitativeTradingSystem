@@ -34,7 +34,7 @@ class MuZeroNetwork(torch.nn.Module):
     The 'Brain' of the agent. 
     It groups the three sub-networks into one manageable module.
     """
-    def __init__(self, obs_shape, action_dim, hidden_dim, learning_rate):
+    def __init__(self, obs_shape, action_dim, hidden_dim, learning_rate, weight_decay=0.0):
         super().__init__()
         
         # 1. Initialize the three networks
@@ -43,7 +43,7 @@ class MuZeroNetwork(torch.nn.Module):
         self.prediction = PredictionNetwork(hidden_dim, action_dim)
         
         # 2. Setup Optimizer (Adam is standard for MuZero)
-        self.optimizer = optim.Adam(self.parameters(), lr=learning_rate)
+        self.optimizer = optim.Adam(self.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
     def get_device(self):
         return next(self.parameters()).device
@@ -63,19 +63,48 @@ class MuZeroAgent:
             obs_shape=obs_shape,
             action_dim=self.action_dim,
             hidden_dim=config.hidden_size,
-            learning_rate=config.learning_rate
+            learning_rate=config.learning_rate,
+            weight_decay=getattr(config, 'weight_decay', 0.0)
         )
         
         # Move to GPU if available
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.network.to(self.device)
 
-    def select_action(self, observation):
+    def select_action(self, observation, temperature=1.0, add_exploration_noise=True):
         """
         The Planning Step.
         1. Observe the market (Observation -> Hidden State).
         2. Think (Run MCTS).
-        3. Act (Select best action based on visit counts).
+        3. Act (Select an action based on visit counts).
+
+        temperature controls exploration in the PLAYED action:
+          - temperature > 0: sample an action with probability
+            proportional to visit_count ** (1/temperature). Used during
+            training self-play so the agent doesn't always play the same
+            action once one gets an early, possibly-random lead in visits.
+          - temperature == 0: deterministic argmax over visit counts.
+            Used for evaluation/deployment.
+
+        This distinction matters: an always-argmax version of this method
+        let a random initialisation collapse the policy to a single
+        action, filling the replay buffer with degenerate, all-one-action
+        trajectories that reinforced that collapse with every training
+        step -- observed directly in a real 500-episode run, where the
+        trained agent picked one action for 100% of a full evaluation
+        episode.
+
+        add_exploration_noise controls a SEPARATE mechanism -- Dirichlet
+        noise mixed into the MCTS root priors (see mcts.run_mcts). Like
+        temperature, this should be True during training self-play and
+        False during evaluation. Callers evaluating a trained checkpoint
+        should pass both temperature=0 and add_exploration_noise=False.
+
+        Note: the POLICY TRAINING TARGET returned as `probs` is always the
+        raw (temperature=1) visit-count distribution, regardless of the
+        temperature used to choose the played action -- matches the
+        MuZero paper, where temperature governs exploration in play, not
+        the supervision signal used to train the policy head.
         """
         self.network.eval()
         
@@ -84,15 +113,14 @@ class MuZeroAgent:
         
         with torch.no_grad():
             # 1. Convert Observation to Tensor
-            # Shape: (1, 60, 11)
             obs_tensor = torch.FloatTensor(observation).unsqueeze(0).to(self.device)
             
             # 2. Generate Initial Hidden State (s_0)
             root_state = self.network.representation(obs_tensor)
             
             # 3. Run Monte Carlo Tree Search
-            # This builds the tree and returns the root node
-            root = run_mcts(self.config, root_state, self.network, min_max_stats)
+            root = run_mcts(self.config, root_state, self.network, min_max_stats,
+                             add_exploration_noise=add_exploration_noise)
             
             # 4. Extract Visit Counts (The 'Policy')
             visit_counts = [root.children[a].visit_count if a in root.children else 0 
@@ -100,18 +128,27 @@ class MuZeroAgent:
             
             sum_visits = sum(visit_counts)
             
-            # Safety check for 0 visits (should not happen with Dirichlet noise)
             if sum_visits == 0:
                 probs = [1.0 / self.action_dim] * self.action_dim
             else:
                 probs = [v / sum_visits for v in visit_counts]
-            
-            # 5. Select Action
-            # During Training: Sample from probability distribution (Exploration)
-            # During Deployment: Pick the move with max visits (Exploitation)
-            # For now, we use argmax for stability in testing
-            action = np.argmax(visit_counts)
-            
+
+            # 5. Select the PLAYED action.
+            if temperature <= 0:
+                action = int(np.argmax(visit_counts))
+            else:
+                visit_counts_arr = np.array(visit_counts, dtype=np.float64)
+                if visit_counts_arr.sum() <= 0:
+                    action = int(np.random.randint(self.action_dim))
+                else:
+                    scaled = visit_counts_arr ** (1.0 / temperature)
+                    scaled_sum = scaled.sum()
+                    if scaled_sum <= 0 or not np.isfinite(scaled_sum):
+                        action = int(np.argmax(visit_counts))
+                    else:
+                        play_policy = scaled / scaled_sum
+                        action = int(np.random.choice(self.action_dim, p=play_policy))
+
             return action, probs, root.value()
 
     def update(self, batch, k_steps=None):
@@ -153,10 +190,6 @@ class MuZeroAgent:
         hidden_state = self.network.representation(observations)
 
         total_loss = 0.0
-        # Per-component losses are tracked separately (not just summed into
-        # total_loss) so that, e.g., a reward-loss regression like the one
-        # described above shows up immediately in logs/tests rather than
-        # being invisible inside a single combined scalar.
         loss_components = {"value": 0.0, "policy": 0.0, "reward": 0.0}
 
         scale = 1.0 / k_steps

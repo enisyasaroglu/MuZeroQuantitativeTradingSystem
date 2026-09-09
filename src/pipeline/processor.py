@@ -233,25 +233,41 @@ class DataProcessor:
 
 
 if __name__ == "__main__":
-    from src.pipeline.data_fetcher import DataFetcher
+    import argparse
+    from src.pipeline.asset_registry import AssetClass
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--multi-asset", action="store_true",
+                         help="Run the multi-asset pipeline instead of the single config.TICKER.")
+    parser.add_argument("--asset-class", type=str, default=None)
+    args = parser.parse_args()
 
     start_time = time.time()
     console.print(Panel("[bold white]STAGE 2 · FEATURE ENGINEERING[/bold white]",
                          box=box.ROUNDED, expand=False, border_style="cyan"))
 
+    from src.pipeline.data_fetcher import DataFetcher
     fetcher = DataFetcher()
-    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-        raw_df = fetcher.fetch_data([config.TICKER], config.START_DATE, config.END_DATE, verbose=False)
+    processor = DataProcessor()
 
-    if raw_df is not None:
-        processor = DataProcessor()
-        train_df, val_df, test_df = processor.process(raw_df)
+    if args.multi_asset:
+        asset_class = AssetClass(args.asset_class) if args.asset_class else None
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            raw_df, _ = fetcher.fetch_universe(asset_class=asset_class, verbose=False)
+        train_df, val_df, test_df = processor.process_multi_asset(raw_df)
+        file_prefix = "multi_asset_"
+    else:
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            raw_df = fetcher.fetch_data([config.TICKER], config.START_DATE, config.END_DATE, verbose=False)
+        train_df, val_df, test_df = (processor.process(raw_df) if raw_df is not None else (None, None, None))
+        file_prefix = ""
 
+    if train_df is not None:
         save_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../data/processed'))
         os.makedirs(save_path, exist_ok=True)
-        train_df.to_csv(os.path.join(save_path, "train_data.csv"), index=False)
-        val_df.to_csv(os.path.join(save_path, "val_data.csv"), index=False)
-        test_df.to_csv(os.path.join(save_path, "test_data.csv"), index=False)
+        train_df.to_csv(os.path.join(save_path, f"{file_prefix}train_data.csv"), index=False)
+        val_df.to_csv(os.path.join(save_path, f"{file_prefix}val_data.csv"), index=False)
+        test_df.to_csv(os.path.join(save_path, f"{file_prefix}test_data.csv"), index=False)
         elapsed_time = time.time() - start_time
 
         split_table = Table(title="Dataset Splits", box=box.ROUNDED, header_style="bold green")
@@ -272,23 +288,10 @@ if __name__ == "__main__":
         meta = Table.grid(padding=(0, 2))
         meta.add_column(style="bold cyan")
         meta.add_column(style="white")
+        meta.add_row("Mode", "Multi-asset" if args.multi_asset else "Single-asset")
         meta.add_row("Embargo", f"{config.EMBARGO_DAYS} trading days (pure gap, not counted in split size)")
         meta.add_row("Features", f"{len(config.TECH_INDICATORS)} technical indicators + log_return_norm")
-        meta.add_row("Normalization", "Z-score, fitted on Training set only")
+        meta.add_row("Normalization", "Z-score, fitted on Training set only" + (" (per ticker)" if args.multi_asset else ""))
         meta.add_row("Raw OHLC / day", "Dropped before saving")
         meta.add_row("Processing Time", f"{elapsed_time:.2f}s")
         console.print(Panel(meta, box=box.ROUNDED, border_style="green", expand=False))
-
-        preview_cols = [c for c in ['date', 'log_return', 'log_return_norm'] + list(config.TECH_INDICATORS)
-                        if c in train_df.columns]
-        feature_table = Table(box=box.ROUNDED, header_style="bold blue", title="Training Features Preview")
-        for col in preview_cols:
-            feature_table.add_column(col, justify="center" if col == "date" else "right")
-        for _, row in train_df[preview_cols].head().iterrows():
-            feature_table.add_row(*[
-                pd.to_datetime(row[c]).strftime('%Y-%m-%d') if c == 'date'
-                else f"{row[c]:.4f}" if isinstance(row[c], (float, np.floating))
-                else str(row[c])
-                for c in preview_cols
-            ])
-        console.print(feature_table)
