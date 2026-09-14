@@ -33,10 +33,27 @@ class StockTradingEnv(gym.Env):
 
     metadata = {'render_modes': ['human']}
 
-    def __init__(self, df, mode='train', use_dsr=None):
+    def __init__(self, df, mode='train', use_dsr=None, window_size=None):
+        """
+        window_size: if set, reset() samples a random contiguous slice of
+        this many rows from self.df each episode, instead of always
+        walking the full sequence from self.lookback to the end. This
+        prevents an agent from memorising one fixed historical path
+        (confirmed directly: MuZero's training dashboard showed
+        near-identical portfolio values recurring across non-adjacent
+        episodes, consistent with the policy reproducing the same trade
+        sequence on the same dates every time) rather than learning
+        features that generalise across regimes.
+
+        window_size=None (default) preserves the ORIGINAL full-sequential
+        behaviour -- unchanged for evaluation/backtesting, where walking
+        the complete, real chronological sequence is the correct thing to
+        do, not an oversight to fix. Only pass window_size for TRAINING.
+        """
         super(StockTradingEnv, self).__init__()
         self.df = df.reset_index(drop=True)
         self.mode = mode
+        self.window_size = window_size
 
         # Action Space: 0=Short, 1=Neutral, 2=Long
         self.action_space = spaces.Discrete(3)
@@ -78,17 +95,38 @@ class StockTradingEnv(gym.Env):
 
     def reset(self, seed=None, options=None):
         """
-        Resets the environment to the start of the window AND to the
-        initial capital. Both must be reset explicitly -- an earlier
-        version of this environment reset current_step but not
-        portfolio_value, which meant each new episode silently inherited
-        whatever capital the previous episode ended with. That bug
-        produced anomalous, non-independent validation results across
+        Resets to the start of a fresh episode window.
+
+        With window_size set: samples a random contiguous slice
+        [start, start+window_size) from self.df, so each episode covers a
+        different historical period rather than always the same full
+        sequence -- see window_size's docstring in __init__.
+
+        Both current_step AND portfolio_value are reset explicitly --
+        an earlier version of this environment reset current_step but
+        not portfolio_value, which meant each new episode silently
+        inherited whatever capital the previous episode ended with. That
+        bug produced anomalous, non-independent validation results across
         checkpoints.
         """
         super().reset(seed=seed)
 
-        self.current_step = self.lookback
+        if self.window_size is not None:
+            max_start = len(self.df) - self.window_size
+            if max_start <= self.lookback:
+                # Not enough data for a full window -- fall back to the
+                # full sequence rather than raising, matching the
+                # window_size=None behaviour.
+                self._window_start = self.lookback
+                self._window_end = len(self.df)
+            else:
+                self._window_start = self.np_random.integers(self.lookback, max_start + 1)
+                self._window_end = self._window_start + self.window_size
+        else:
+            self._window_start = self.lookback
+            self._window_end = len(self.df)
+
+        self.current_step = self._window_start
         self.current_action = 1  # Neutral
         self.portfolio_value = config.INITIAL_CAPITAL
         self.portfolio_history = [config.INITIAL_CAPITAL]
@@ -100,7 +138,8 @@ class StockTradingEnv(gym.Env):
         """
         Executes one time step.
         """
-        terminated = self.current_step >= len(self.df) - 1
+        window_end = getattr(self, '_window_end', len(self.df))
+        terminated = self.current_step >= min(window_end, len(self.df)) - 1
         if terminated:
             return self._get_observation(), 0.0, True, False, {
                 'portfolio_value': self.portfolio_value,
