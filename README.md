@@ -108,11 +108,12 @@ Each of these is covered by a regression test in `tests/` (see `test_env.py::tes
 
 ```bash
 pip install -r requirements.txt
-python src/pipeline/processor.py        # fetch + process data -> data/processed/{train,val,test}_data.csv
-python main_ppo.py                      # train PPO baseline (checkpoints -> src/models/)
-python main_muzero.py                   # train MuZero
-python evaluate.py --agent all --split test   # evaluate all agents, save metrics to logs/evaluation/
-pytest tests/                           # run the full test suite (29 tests)
+python src/pipeline/data_fetcher.py --multi-asset   # fetch multiple assets
+python src/pipeline/processor.py                    # fetch + process data -> data/processed/{train,val,test}_data.csv
+python main_ppo.py                                  # train PPO baseline (checkpoints -> src/models/)
+python main_muzero.py                               # train MuZero
+python evaluate.py --agent all --split test         # evaluate all agents, save metrics to logs/evaluation/
+pytest tests/                                       # run the full test suite (29 tests)
 ```
 
 ## Testing
@@ -157,3 +158,5 @@ Full bibliography in the accompanying dissertation.
 ## License
 
 MIT# MuZeroQuantitativeTradingSystem
+
+

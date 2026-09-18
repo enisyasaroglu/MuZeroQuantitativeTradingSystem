@@ -6,6 +6,7 @@ import contextlib
 import io
 import pandas as pd
 import numpy as np
+import yfinance as yf
 from finrl.meta.preprocessor.yahoodownloader import YahooDownloader
 from rich.console import Console
 from rich.panel import Panel
@@ -61,12 +62,37 @@ class DataFetcher:
 
         try:
             with console.status("[bold green]Connecting to Yahoo Finance...[/bold green]", spinner="dots"):
-                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-                    df = YahooDownloader(
-                        start_date=start_date,
-                        end_date=end_date,
-                        ticker_list=ticker_list
-                    ).fetch_data()
+                raw_data = yf.download(
+                    tickers=ticker_list,
+                    start=start_date,
+                    end=end_date,
+                    progress=False
+                )
+
+                df_list = []
+                if len(ticker_list) == 1:
+                    tic = ticker_list[0]
+                    temp = raw_data.reset_index()
+                    temp.columns = [c[0].lower() if isinstance(c, tuple) else c.lower() for c in temp.columns]
+                    temp['tic'] = tic
+                    df_list.append(temp)
+                else:
+                    for tic in ticker_list:
+                        if tic in raw_data.columns.levels[1]:
+                            temp = raw_data.xs(tic, axis=1, level=1).dropna(how='all').reset_index()
+                            temp.columns = [c.lower() for c in temp.columns]
+                            temp['tic'] = tic
+                            df_list.append(temp)
+
+                if df_list:
+                    df = pd.concat(df_list, ignore_index=True)
+                    if 'adj close' in df.columns:
+                        df['close'] = df['adj close']
+                    df['day'] = pd.to_datetime(df['date']).dt.dayofweek
+                    expected_cols = ['date', 'open', 'high', 'low', 'close', 'volume', 'tic', 'day']
+                    df = df[[c for c in expected_cols if c in df.columns]]
+                else:
+                    df = pd.DataFrame()
 
             if df is None or df.empty:
                 if verbose:

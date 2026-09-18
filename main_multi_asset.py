@@ -127,7 +127,17 @@ def train_muzero(num_episodes=20):
 
 def train_ppo(num_episodes=50):
     df = load_multi_asset_split("train")
-    env = MultiAssetTradingEnv(df)
+
+    # use_dsr=False: base_config.py's USE_DSR_REWARD defaults to True.
+    # Without this override, PPO's multi-asset training reward was
+    # silently DSR-shaped while the PnL/Sharpe shown in this dashboard
+    # are computed from net_return -- the same DSR-vs-raw-return
+    # mismatch already fixed for MuZero in train_muzero() above, never
+    # previously checked for PPO's multi-asset path specifically. This
+    # is one plausible contributor to the -75.51% multi-asset average
+    # return -- confirmed as a real mismatch, not yet confirmed as the
+    # full explanation for that magnitude.
+    env = MultiAssetTradingEnv(df, use_dsr=False)
 
     agent = PPOAgent(obs_shape=env.observation_space.shape, action_dim=env.n_actions)
 
@@ -163,12 +173,6 @@ def train_ppo(num_episodes=50):
 
             state = next_state
 
-        # PPOAgent.update() returns (policy_loss, value_loss, entropy) --
-        # a 3-tuple, since the fix that made Value Loss actually reflect
-        # the critic's real training signal. The previous len==2-only
-        # check here fell through to float(update_result) on every real
-        # call, which raises TypeError on a 3-element tuple. Matches the
-        # exhaustive unpacking already used in main_ppo.py.
         update_result = agent.update(memory)
         if isinstance(update_result, tuple):
             if len(update_result) == 3:
@@ -190,7 +194,7 @@ def train_ppo(num_episodes=50):
         )
 
         if episode % 10 == 0:
-            save_path = os.path.join('src', 'models', f'ppo_multiasset_checkpoint_{episode}.pth')
+            save_path = os.path.join('src', 'checkpoints', f'ppo_multiasset_checkpoint_{episode}.pth')
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
             torch.save(agent.policy.state_dict(), save_path)
 

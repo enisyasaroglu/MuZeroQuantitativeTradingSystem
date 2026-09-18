@@ -34,3 +34,6 @@ class MuZeroConfig:
     # UCB Score Formula Constants (Standard MuZero values)
     pb_c_base: int = 19652
     pb_c_init: float = 1.25
+
+    # Training Hyperparameters
+    unroll_steps: int = 3             # Reduced from 5 to 3 for faster training

@@ -40,6 +40,7 @@ class QuantRLLogger:
         table = Table(title=f"Recent Performance ({self.agent_name})", border_style="dim")
 
         table.add_column("Cycle", justify="right", style="cyan", no_wrap=True)
+        table.add_column("Portfolio Value", justify="right", style="green")
         table.add_column("Strategy PnL (%)", justify="right")
         table.add_column("Sharpe Ratio", justify="right", style="yellow")
         table.add_column("Max Drawdown (%)", justify="right", style="red")
@@ -54,6 +55,7 @@ class QuantRLLogger:
             
             table.add_row(
                 f"#{entry['cycle']}",
+                f"{entry['portfolio_value']:,.2f}",
                 f"[{pnl_style}]{pnl:+.2f}%[/{pnl_style}]",
                 f"{entry['sharpe']:.2f}",
                 f"{entry['max_drawdown']:.2f}%",
@@ -89,18 +91,24 @@ class QuantRLLogger:
         pos_days = np.sum(returns > 0)
         win_rate = (pos_days / len(returns)) * 100.0 if len(returns) > 0 else 0.0
 
-        # 3. Max Drawdown Percentage
+        # 3. Max Drawdown Percentage -- negative-fraction convention,
+        # matching src/utils/metrics.py.max_drawdown (a decline is
+        # reported as e.g. -12.4, not +12.4). Confirmed live: earlier
+        # multi-asset training output showed drawdowns like "85.19%"
+        # with no minus sign, which is exactly this bug reappearing.
         peaks = np.maximum.accumulate(port_vals)
-        drawdowns = (peaks - port_vals) / peaks
-        max_drawdown = np.max(drawdowns) * 100.0 if len(drawdowns) > 0 else 0.0
+        drawdowns = (port_vals - peaks) / peaks
+        max_drawdown = np.min(drawdowns) * 100.0 if len(drawdowns) > 0 else 0.0
 
-        # 4. Annualized Sharpe Ratio
-        std_ret = np.std(returns)
+        # 4. Annualized Sharpe Ratio -- ddof=1 (sample std), matching
+        # src/utils/metrics.py.sharpe_ratio's convention.
+        std_ret = np.std(returns, ddof=1) if len(returns) > 1 else 0.0
         mean_ret = np.mean(returns)
         sharpe = (mean_ret / (std_ret + 1e-8)) * np.sqrt(252) if std_ret > 0 else 0.0
 
         self.history.append({
             "cycle": cycle,
+            "portfolio_value": port_vals[-1],
             "pnl_pct": pnl_pct,
             "sharpe": sharpe,
             "max_drawdown": max_drawdown,
@@ -130,3 +138,32 @@ class QuantRLLogger:
         )
         console.print("\n")
         console.print(Panel(summary_text, title="[bold green]TRAINING SESSION COMPLETED[/bold green]", border_style="green", expand=False))
+        
+    def print_evaluation_report(self, name: str, metrics: dict, action_dist: dict, final_value: float):
+        """
+        One-shot formatted report for a SINGLE completed evaluation run --
+        distinct from log_cycle()/start_dashboard(), which are built
+        around repeated updates across many training episodes. Uses this
+        class's own Rich console/table conventions so evaluation output
+        looks consistent with the training dashboard, without forcing a
+        one-shot report through a live-updating API built for something
+        else.
+        """
+        table = Table(title=f"Evaluation Report: {name}", border_style="dim")
+        table.add_column("Metric", style="cyan")
+        table.add_column("Value", justify="right")
+
+        table.add_row("Final Portfolio Value", f"{final_value:,.2f}")
+        table.add_row("Total Return", f"{metrics['total_return']:+.2%}")
+        table.add_row("CAGR", f"{metrics['cagr']:+.2%}")
+        table.add_row("Sharpe Ratio", f"{metrics['sharpe_ratio']:.2f}")
+        table.add_row("Sortino Ratio", f"{metrics['sortino_ratio']:.2f}")
+        table.add_row("Max Drawdown", f"{metrics['max_drawdown']:.2%}")
+        table.add_row("Calmar Ratio", f"{metrics['calmar_ratio']:.2f}")
+        table.add_row("Win Rate", f"{metrics['win_rate']:.2%}")
+        table.add_row(
+            "Action Distribution",
+            f"Short {action_dist['Short']:.1f}% | Neutral {action_dist['Neutral']:.1f}% | Long {action_dist['Long']:.1f}%"
+        )
+
+        console.print(table)

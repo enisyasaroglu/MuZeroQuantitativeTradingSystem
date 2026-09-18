@@ -42,16 +42,15 @@ UNIVERSE = [
     Asset("MSFT", "Microsoft Corporation", AssetClass.EQUITY),
     Asset("AMZN", "Amazon.com, Inc.", AssetClass.EQUITY),
     Asset("GOOGL", "Alphabet Inc. (Class A)", AssetClass.EQUITY),
+    Asset("NVDA", "NVIDIA Corporation", AssetClass.EQUITY),
+    Asset("TSLA", "Tesla, Inc.", AssetClass.EQUITY),
 ]
 
 """ # TODO: add more assets
     Asset("^IXIC", "Nasdaq Composite Index", AssetClass.INDEX),
     Asset("^DJI", "Dow Jones Industrial Average", AssetClass.INDEX),
     Asset("^RUT", "Russell 2000 Index", AssetClass.INDEX),
-    Asset("^VIX", "CBOE Volatility Index", AssetClass.INDEX),
-    Asset("TSLA", "Tesla, Inc.", AssetClass.EQUITY),
     Asset("BRK-B", "Berkshire Hathaway Inc. (Class B)", AssetClass.EQUITY),
-    Asset("NVDA", "NVIDIA Corporation", AssetClass.EQUITY),
     Asset("JPM", "JPMorgan Chase & Co.", AssetClass.EQUITY),
     Asset("V", "Visa Inc.", AssetClass.EQUITY),
     Asset("JNJ", "Johnson & Johnson", AssetClass.EQUITY),

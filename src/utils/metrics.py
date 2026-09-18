@@ -89,6 +89,38 @@ def win_rate(portfolio_values):
         return 0.0
     return float(np.mean(returns > 0))
 
+def annualized_volatility(portfolio_values, periods_per_year=TRADING_DAYS_PER_YEAR):
+    """Annualised standard deviation of per-step returns -- the actual
+    RISK figure, reported alongside (not instead of) Sharpe/Sortino.
+    Two strategies can share a Sharpe ratio while having very different
+    absolute swings; this makes that visible directly."""
+    returns = _returns_from_values(portfolio_values)
+    if len(returns) < 2:
+        return 0.0
+    return float(np.std(returns, ddof=1) * np.sqrt(periods_per_year))
+
+
+def worst_single_period_loss(portfolio_values):
+    """The single worst one-step return in the series -- a direct answer
+    to 'how bad can one day be', distinct from max_drawdown (which is
+    peak-to-trough over possibly many steps, not a single-step figure)."""
+    returns = _returns_from_values(portfolio_values)
+    if len(returns) == 0:
+        return 0.0
+    return float(np.min(returns))
+
+
+def rolling_drawdown_series(portfolio_values):
+    """Drawdown from the running peak at EVERY step, not just the single
+    worst value -- the series an 'underwater' chart would plot. Not
+    wired into a chart yet (optional, per the necessary/optional split);
+    included now since it's cheap and the function itself is trivial to
+    verify against max_drawdown (should always contain max_drawdown as
+    its minimum value)."""
+    values = np.asarray(portfolio_values, dtype=np.float64)
+    running_max = np.maximum.accumulate(values)
+    return ((values - running_max) / running_max).tolist()
+
 
 def compute_all_metrics(portfolio_values, periods_per_year=TRADING_DAYS_PER_YEAR, risk_free_rate=0.0):
     """Convenience wrapper returning the standard metric set used
@@ -101,4 +133,7 @@ def compute_all_metrics(portfolio_values, periods_per_year=TRADING_DAYS_PER_YEAR
         "max_drawdown": max_drawdown(portfolio_values),
         "calmar_ratio": calmar_ratio(portfolio_values, periods_per_year),
         "win_rate": win_rate(portfolio_values),
+        "annualized_volatility": annualized_volatility(portfolio_values, periods_per_year),
+        "worst_single_period_loss": worst_single_period_loss(portfolio_values),
+        "rolling_drawdown_series": rolling_drawdown_series(portfolio_values),
     }

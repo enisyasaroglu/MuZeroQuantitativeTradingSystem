@@ -16,6 +16,7 @@ warnings.filterwarnings("ignore")
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../')))
 from configs.base_config import config
+from src.regime.regime_detector import RegimeDetector
 
 console = Console()
 
@@ -112,6 +113,23 @@ class DataProcessor:
 
         return self._drop_raw_ohlc(train_df), self._drop_raw_ohlc(val_df), self._drop_raw_ohlc(test_df)
 
+
+    def add_regime_features(train_df: pd.DataFrame, test_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+        detector = RegimeDetector(n_states=3, window=20)
+        
+        # Fit on train log-returns, predict on train and test
+        train_regimes, test_regimes = detector.fit_predict_pipeline(
+            train_df["log_return"], 
+            test_df["log_return"]
+        )
+        
+        # Merge one-hot features back into dataframes
+        train_out = train_df.join(train_regimes[["regime_bear", "regime_sideways", "regime_bull"]])
+        test_out = test_df.join(test_regimes[["regime_bear", "regime_sideways", "regime_bull"]])
+        
+        # Forward-fill initial warmup NaN values from rolling window
+        return train_out.bfill(), test_out.bfill()
+        
     @staticmethod
     def _drop_raw_ohlc(df):
         """Drops raw price-scale columns before the frame reaches

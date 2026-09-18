@@ -118,7 +118,7 @@ def run_muzero():
         
         # Save model checkpoint periodically without printing duplicated tables
         if episode % 5 == 0:
-            save_path = os.path.join('src', 'models', f'muzero_checkpoint_{episode}.pth')
+            save_path = os.path.join('src', 'checkpoints', f'muzero_checkpoint_{episode}.pth')
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
             torch.save(agent.network.state_dict(), save_path)
 

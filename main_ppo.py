@@ -16,11 +16,10 @@ import os
 import pandas as pd
 import torch
 
+from configs.ppo_config import ppo_config
 from src.env.trading_env import StockTradingEnv
 from src.agents.baselines.ppo_agent import PPOAgent
-from src.utils.schedules import entropy_coef_schedule
 from utils.dashboard_logger import QuantRLLogger
-
 
 def run_ppo(num_episodes=500, checkpoint_every=5):
     data_path = os.path.join('data', 'processed', 'train_data.csv')
@@ -29,9 +28,12 @@ def run_ppo(num_episodes=500, checkpoint_every=5):
         return
     df = pd.read_csv(data_path)
 
-    env = StockTradingEnv(df)
-    agent = PPOAgent(obs_shape=env.observation_space.shape, action_dim=env.action_space.n)
-
+    env = StockTradingEnv(df, window_size=252)
+    action_dim = getattr(env, 'action_dim', getattr(env, 'n_actions', getattr(getattr(env, 'action_space', None), 'n', 3)))
+    
+    # Initialize PPOAgent with explicit configuration object
+    agent = PPOAgent(obs_shape=env.observation_space.shape, action_dim=action_dim, cfg=ppo_config)
+    
     logger = QuantRLLogger(
         agent_name="PPO",
         asset_symbol="SPY",
@@ -43,15 +45,12 @@ def run_ppo(num_episodes=500, checkpoint_every=5):
 
     for episode in range(1, num_episodes + 1):
         state, _ = env.reset()
-        memory = {'states': [], 'actions': [], 'log_probs': [], 'rewards': [], 'dones': []}
+        memory = {'states': [], 'actions': [], 'log_probs': [], 'values': [], 'rewards': [], 'dones': []}
         
         # Track full trajectory metrics for quantitative log calculations
-        portfolio_history = [getattr(env, 'portfolio_value', 10000.0)]
+        portfolio_history = [getattr(env, 'portfolio_value', 100000.0)]
         daily_returns = []
         done = False
-
-        # Anneal the entropy bonus over training
-        agent.entropy_coef = entropy_coef_schedule(episode, num_episodes)
 
         while not done:
             action, log_prob, value = agent.select_action(state)
@@ -61,29 +60,20 @@ def run_ppo(num_episodes=500, checkpoint_every=5):
             memory['states'].append(state)
             memory['actions'].append(action)
             memory['log_probs'].append(log_prob)
+            memory['values'].append(value)
             memory['rewards'].append(reward)
             memory['dones'].append(done)
 
             # Record step metrics. True net return from the info dict --
             # same fix as main_muzero.py; getattr(env, 'daily_return', ...)
             # never resolved since the environment never sets that attribute.
-            portfolio_history.append(getattr(env, 'portfolio_value', 10000.0))
+            portfolio_history.append(getattr(env, 'portfolio_value', 100000.0))
             daily_returns.append(info.get('net_return', reward))
 
             state = next_state
 
         # Update policy and extract losses
-        update_result = agent.update(memory)
-        if isinstance(update_result, tuple):
-            if len(update_result) == 3:
-                policy_loss, value_loss, _ = update_result
-            elif len(update_result) == 2:
-                policy_loss, _ = update_result
-                value_loss = 0.0
-            else:
-                policy_loss, value_loss = update_result[0], update_result[1]
-        else:
-            policy_loss, value_loss = float(update_result), 0.0
+        policy_loss, value_loss, _ = agent.update(memory)
 
         # Refresh single live table in terminal
         logger.log_cycle(
@@ -96,7 +86,7 @@ def run_ppo(num_episodes=500, checkpoint_every=5):
 
         # Save model checkpoints periodically without printing table duplicates
         if episode % checkpoint_every == 0:
-            save_path = os.path.join('src', 'models', f'ppo_checkpoint_{episode}.pth')
+            save_path = os.path.join('src', 'checkpoints', f'ppo_checkpoint_{episode}.pth')
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
             torch.save(agent.policy.state_dict(), save_path)
 
