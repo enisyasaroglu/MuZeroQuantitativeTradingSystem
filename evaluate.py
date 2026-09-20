@@ -19,7 +19,7 @@ from configs.base_config import config as base_config
 from configs.muzero_config import MuZeroConfig
 from src.env.trading_env import StockTradingEnv
 from src.agents.muzero.muzero_agent import MuZeroAgent
-from src.agents.baselines.ppo_agent import PPOAgent
+from src.agents.ppo.ppo_agent import PPOAgent
 from src.utils.dashboard_logger import QuantRLLogger
 from src.utils.metrics import compute_all_metrics, annualized_volatility, worst_single_period_loss
 
@@ -92,7 +92,7 @@ def evaluate_muzero(df, checkpoint_path):
             f"evaluating an untrained network. Train one first with `python main_muzero.py`."
         )
 
-    env = StockTradingEnv(df, use_dsr=False)
+    env = StockTradingEnv(df, use_dsr=True)
     cfg = MuZeroConfig()
     
     # Robust instantiation across config parameter order
@@ -137,7 +137,7 @@ def evaluate_ppo(df, checkpoint_path):
             f"evaluating an untrained network. Train one first with `python main_ppo.py`."
         )
 
-    env = StockTradingEnv(df, use_dsr=False)
+    env = StockTradingEnv(df, use_dsr=True)
     action_dim = getattr(env, 'action_dim', getattr(env, 'n_actions', getattr(getattr(env, 'action_space', None), 'n', 3)))
     
     agent = PPOAgent(obs_shape=env.observation_space.shape, action_dim=action_dim)

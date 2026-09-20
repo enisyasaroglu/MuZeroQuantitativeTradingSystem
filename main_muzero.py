@@ -19,7 +19,17 @@ def run_muzero():
         return
     df = pd.read_csv(data_path)
     
-    env = StockTradingEnv(df)
+    # use_dsr=False: with DSR active, this reward has a proven property --
+    # once the running-average return goes negative, doing nothing
+    # (net_return=0) is strictly better than continuing to trade, with no
+    # downside. Confirmed twice via completed 500-episode runs whose
+    # FINAL episodes showed exactly +0.00% PnL / 0.00% drawdown / 0.0%
+    # win rate. Raw net log-return doesn't have this property.
+    #
+    # window_size=252: samples a random ~1-year slice per episode instead
+    # of always walking the same fixed sequence, preventing the agent
+    # from memorising one specific historical path.
+    env = StockTradingEnv(df, use_dsr=False, window_size=252)
     obs_shape = env.observation_space.shape
     
     agent = MuZeroAgent(config, obs_shape)
@@ -27,7 +37,13 @@ def run_muzero():
     buffer = ReplayBuffer(
         capacity=2000,
         batch_size=config.batch_size, 
-        unroll_steps=5, 
+        unroll_steps=config.unroll_steps,  # read from config (currently 3),
+                                            # not hardcoded -- was
+                                            # previously hardcoded to 5,
+                                            # out of sync with
+                                            # main_multi_asset.py's
+                                            # train_muzero(), which
+                                            # already reads this correctly
         discount=config.discount_factor
     )
     
@@ -39,7 +55,6 @@ def run_muzero():
         total_episodes=num_episodes
     )
     
-    # Start the live updating terminal view
     logger.start_dashboard()
 
     for episode in range(1, num_episodes + 1):
@@ -47,7 +62,6 @@ def run_muzero():
         done = False
         temperature = temperature_schedule(episode, num_episodes)
         
-        # Trajectory tracking for financial quantitative metrics
         portfolio_history = [getattr(env, 'portfolio_value', 10000.0)]
         daily_returns = []
         
@@ -71,11 +85,6 @@ def run_muzero():
             game_history['values'].append(value)
             
             portfolio_history.append(getattr(env, 'portfolio_value', 10000.0))
-            # True net return from the environment's info dict -- env never
-            # sets a `daily_return` attribute, so the previous
-            # getattr(env, 'daily_return', reward) call always silently
-            # fell back to `reward`, which is DSR-shaped (not the true
-            # return) whenever USE_DSR_REWARD is True.
             daily_returns.append(info.get('net_return', reward))
             
             obs = next_obs
@@ -89,12 +98,8 @@ def run_muzero():
             
             for _ in range(num_updates): 
                 batch = buffer.sample_batch()
-                loss_out, loss_components = agent.update(batch, k_steps=5)
+                loss_out, loss_components = agent.update(batch, k_steps=config.unroll_steps)
                 
-                # Safely parse loss components. MuZeroAgent.update() returns
-                # keys 'value'/'policy'/'reward' (not 'value_loss'/
-                # 'policy_loss') -- the previous key names here always
-                # missed, pinning Value Loss at 0.0 for the entire run.
                 if isinstance(loss_components, dict):
                     total_policy_loss += float(loss_components.get('policy', loss_out))
                     total_value_loss += float(loss_components.get('value', 0.0))
@@ -107,7 +112,6 @@ def run_muzero():
             policy_loss = total_policy_loss / num_updates
             value_loss = total_value_loss / num_updates
         
-        # Update live terminal dashboard
         logger.log_cycle(
             cycle=episode,
             portfolio_values=portfolio_history,
@@ -116,13 +120,15 @@ def run_muzero():
             value_loss=value_loss
         )
         
-        # Save model checkpoint periodically without printing duplicated tables
         if episode % 5 == 0:
+            # src/checkpoints, not src/models -- matches the directory
+            # main_ppo.py, main_multi_asset.py, and evaluate.py's
+            # find_latest_checkpoint already use. Left as src/models,
+            # evaluate.py would never find a MuZero checkpoint at all.
             save_path = os.path.join('src', 'checkpoints', f'muzero_checkpoint_{episode}.pth')
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
             torch.save(agent.network.state_dict(), save_path)
 
-    # Stop live screen engine and display final summary panel
     logger.stop_dashboard()
 
 

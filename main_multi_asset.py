@@ -22,7 +22,7 @@ import torch
 from configs.muzero_config import MuZeroConfig
 from src.env.multi_asset_env import MultiAssetTradingEnv
 from src.agents.muzero.muzero_agent import MuZeroAgent
-from src.agents.baselines.ppo_agent import PPOAgent
+from src.agents.ppo.ppo_agent import PPOAgent
 from src.utils.replay_buffer import ReplayBuffer
 from src.utils.schedules import temperature_schedule, entropy_coef_schedule
 from utils.dashboard_logger import QuantRLLogger

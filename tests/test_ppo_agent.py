@@ -3,7 +3,7 @@ import sys
 import os
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '../'))
-from src.agents.baselines.ppo_agent import PPOAgent
+from src.agents.ppo.ppo_agent import PPOAgent
 
 def test_ppo_update():
     # 1. Setup Dummy Data
@@ -29,12 +29,14 @@ def test_ppo_update():
     
     # 4. Test Update Step
     initial_loss = agent.update(memory)
-    print(f"Update Step Loss: {initial_loss:.4f}")
+    # Extract the main loss value if a tuple is returned
+    loss_val = initial_loss[0] if isinstance(initial_loss, tuple) else initial_loss
+    print(f"Update Step Loss: {loss_val:.4f}")
     
     # 5. Verify Model Changed
-    # Run update again, loss should ideally be different (though not guaranteed to be lower immediately)
     loss_2 = agent.update(memory)
-    print(f"Second Step Loss: {loss_2:.4f}")
+    loss_2_val = loss_2[0] if isinstance(loss_2, tuple) else loss_2
+    print(f"Second Step Loss: {loss_2_val:.4f}")
     
     print("Success! PPO Agent handles selection and updates.")
 
