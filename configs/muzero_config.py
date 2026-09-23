@@ -19,13 +19,14 @@ class MuZeroConfig:
     hidden_size: int = 64           # Neurons in MLP layers
     
     # 3. Training Hyperparameters
-    learning_rate: float = 0.001
-    batch_size: int = 8
+    learning_rate: float = 0.0003
+    batch_size: int = 64
     discount_factor: float = 0.99 
     weight_decay: float = 1e-4      # L2 Regularization
+    entropy_loss_weight: float = 0.01  # Encourage exploration
 
     # 4. MCTS Specifics (The "Brain" Settings)
-    num_simulations: int = 50       # Reduced from 800 to 50 for speed 
+    num_simulations: int = 150       # Reduce from 800 to 50 for speed 
     
     # Root Noise (Exploration)
     root_dirichlet_alpha: float = 0.3
@@ -36,4 +37,4 @@ class MuZeroConfig:
     pb_c_init: float = 1.25
 
     # Training Hyperparameters
-    unroll_steps: int = 3             # Reduced from 5 to 3 for faster training
+    unroll_steps: int = 5             # Reduce from 5 to 3 for faster training

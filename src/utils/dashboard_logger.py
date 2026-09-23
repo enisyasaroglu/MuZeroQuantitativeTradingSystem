@@ -47,7 +47,7 @@ class QuantRLLogger:
         table.add_column("Win Rate (%)", justify="right", style="magenta")
         table.add_column("Policy Loss", justify="right", style="blue")
         table.add_column("Value Loss", justify="right", style="blue")
-
+        table.add_column("Policy Entropy", justify="right", style="blue")
         recent_entries = self.history[-last_n:]
         for entry in recent_entries:
             pnl = entry["pnl_pct"]
@@ -61,7 +61,8 @@ class QuantRLLogger:
                 f"{entry['max_drawdown']:.2f}%",
                 f"{entry['win_rate']:.1f}%",
                 f"{entry['policy_loss']:.4f}",
-                f"{entry['value_loss']:.4f}"
+                f"{entry['value_loss']:.4f}",
+                f"{entry['policy_entropy']:.4f}"
             )
 
         return table
@@ -78,7 +79,8 @@ class QuantRLLogger:
         portfolio_values: list,
         daily_returns: list,
         policy_loss: float,
-        value_loss: float
+        value_loss: float,
+        policy_entropy: float
     ):
         """Calculates performance metrics dynamically per episode."""
         port_vals = np.array(portfolio_values)
@@ -114,7 +116,8 @@ class QuantRLLogger:
             "max_drawdown": max_drawdown,
             "win_rate": win_rate,
             "policy_loss": policy_loss,
-            "value_loss": value_loss
+            "value_loss": value_loss,
+            "policy_entropy": policy_entropy 
         })
 
         if self.live:

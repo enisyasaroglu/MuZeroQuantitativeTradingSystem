@@ -3,25 +3,55 @@ Evaluation script: runs one or more agents on a held-out data split and
 reports the standardised financial metric set (total return, CAGR,
 Sharpe, Sortino, max drawdown, Calmar, win rate), matching the tables
 in the dissertation's Results & Evaluation chapter.
+
+Usage:
+    python evaluate.py --split test
+    python evaluate.py --split test --agent ppo --checkpoint src/checkpoints/ppo_checkpoint_500.pth
+    python evaluate.py --split test --max-drawdown 0.15 --cooldown-steps 5
+
+Evaluation intentionally uses RAW net log-return as the environment
+reward (use_dsr=False), not the shaped DSR training signal -- financial
+metrics should reflect true realised portfolio performance, not the
+reward-shaping used during training.
+
+DETERMINISTIC EVALUATION, no fallback chains: MuZero is always called
+with temperature=0.0, add_exploration_noise=False. PPO is always called
+with deterministic=True. If either agent's select_action signature ever
+changes, this script will raise a clear TypeError pointing at the exact
+call, rather than silently degrading to a different, training-shaped
+calling convention.
+
+RISK OVERLAY: --max-drawdown enables an optional RiskManager kill-switch
+(src/risk/risk_manager.py) on MuZero and PPO only -- never on
+Buy-and-Hold, which stays a pure passive benchmark with nothing to
+override. Disabled by default.
+
+FULL EQUITY/POSITION TRACKING: every evaluated agent's complete per-step
+portfolio value and position/exposure history is exported to CSV and
+plotted, aligned to real calendar dates -- not just a final-value
+summary, which cannot distinguish "generated wealth then gave it back"
+from "nothing happened".
 """
 
 import argparse
 import glob
 import os
+
 import matplotlib
-matplotlib.use('Agg')  # Non-interactive backend for headless/macOS plot generation
+matplotlib.use("Agg")  # headless-safe backend; avoids GUI-backend issues
 import matplotlib.pyplot as plt
+
 import numpy as np
 import pandas as pd
 import torch
 
-from configs.base_config import config as base_config
 from configs.muzero_config import MuZeroConfig
 from src.env.trading_env import StockTradingEnv
-from src.agents.muzero.muzero_agent import MuZeroAgent
+from src.agents.muzero.muzero_agent import MuZeroAgent, load_muzero_checkpoint
 from src.agents.ppo.ppo_agent import PPOAgent
 from src.utils.dashboard_logger import QuantRLLogger
 from src.utils.metrics import compute_all_metrics, annualized_volatility, worst_single_period_loss
+from src.risk.risk_manager import RiskManager
 
 ACTION_NAMES = {0: "Short", 1: "Neutral", 2: "Long"}
 POSITION_EXPOSURE_PCT = {0: -100.0, 1: 0.0, 2: 100.0}
@@ -46,20 +76,24 @@ def find_latest_checkpoint(prefix: str):
 
     def extract_ep(f):
         try:
-            filename = os.path.basename(f)
-            ep_str = filename.replace(f"{prefix}_", "").replace(".pth", "")
-            return int(ep_str)
+            return int(f.split("_")[-1].replace(".pth", ""))
         except ValueError:
             return -1
 
     return max(files, key=extract_ep)
 
 
-def run_episode(env: StockTradingEnv, action_fn):
+def run_episode(env: StockTradingEnv, action_fn, risk_manager: RiskManager = None):
     """
     Runs one full pass over the split. action_fn(obs) -> int action.
 
-    Returns (portfolio_history, action_counts, position_history, step_indices).
+    risk_manager: optional RiskManager. When provided, every proposed
+    action is passed through risk_manager.filter_action() before being
+    sent to env.step(). None (default) means no overlay -- unaffected
+    baseline behaviour.
+
+    Returns (portfolio_history, action_counts, position_history,
+    step_indices, risk_overrides).
     """
     obs, _ = env.reset()
     done = False
@@ -67,15 +101,72 @@ def run_episode(env: StockTradingEnv, action_fn):
     position_history = []
     step_indices = []
 
+    if risk_manager is not None:
+        risk_manager.reset(initial_value=env.portfolio_value)
+
     while not done:
         step_indices.append(env.current_step)
-        action = action_fn(obs)
+        proposed_action = action_fn(obs)
+
+        action = (
+            risk_manager.filter_action(proposed_action, env.portfolio_value)
+            if risk_manager is not None else proposed_action
+        )
+
         action_counts[int(action)] += 1
         position_history.append(int(action))
         obs, reward, terminated, truncated, info = env.step(action)
         done = terminated or truncated
 
-    return env.portfolio_history, action_counts, position_history, step_indices
+    risk_overrides = risk_manager.triggered_count if risk_manager is not None else 0
+    return env.portfolio_history, action_counts, position_history, step_indices, risk_overrides
+
+
+def evaluate_muzero(df, checkpoint_path, risk_manager: RiskManager = None):
+    if not checkpoint_path or not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(
+            f"No MuZero checkpoint found ({checkpoint_path}). Aborting rather than "
+            f"evaluating an untrained network. Train one first with `python main_muzero.py`."
+        )
+
+    env = StockTradingEnv(df, use_dsr=False)
+    cfg = MuZeroConfig()
+    agent = MuZeroAgent(cfg, env.observation_space.shape)
+    load_muzero_checkpoint(agent, checkpoint_path)
+    print(f"Loaded MuZero checkpoint: {checkpoint_path}")
+
+    def action_fn(obs):
+        action, _, _ = agent.select_action(obs, temperature=0.0, add_exploration_noise=False)
+        return action
+
+    return run_episode(env, action_fn, risk_manager=risk_manager)
+
+
+def evaluate_ppo(df, checkpoint_path, risk_manager: RiskManager = None):
+    if not checkpoint_path or not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(
+            f"No PPO checkpoint found ({checkpoint_path}). Aborting rather than "
+            f"evaluating an untrained network. Train one first with `python main_ppo.py`."
+        )
+
+    env = StockTradingEnv(df, use_dsr=False)
+    agent = PPOAgent(obs_shape=env.observation_space.shape, action_dim=env.action_space.n)
+    agent.policy.load_state_dict(torch.load(checkpoint_path, map_location=agent.device))
+    agent.policy.eval()
+    print(f"Loaded PPO checkpoint: {checkpoint_path}")
+
+    def action_fn(obs):
+        action, _, _ = agent.select_action(obs, deterministic=True)
+        return action
+
+    return run_episode(env, action_fn, risk_manager=risk_manager)
+
+
+def evaluate_buy_and_hold(df):
+    """No risk overlay -- Buy-and-Hold is deliberately the pure passive
+    benchmark with no active decisions to override."""
+    env = StockTradingEnv(df, use_dsr=False)
+    return run_episode(env, action_fn=lambda obs: 2)  # always Long
 
 
 def action_distribution_pct(action_counts):
@@ -85,117 +176,33 @@ def action_distribution_pct(action_counts):
     return {ACTION_NAMES[a]: 100.0 * c / total for a, c in action_counts.items()}
 
 
-def evaluate_muzero(df, checkpoint_path):
-    if not checkpoint_path or not os.path.exists(checkpoint_path):
-        raise FileNotFoundError(
-            f"No MuZero checkpoint found ({checkpoint_path}). Aborting rather than "
-            f"evaluating an untrained network. Train one first with `python main_muzero.py`."
-        )
-
-    env = StockTradingEnv(df, use_dsr=True)
-    cfg = MuZeroConfig()
-    
-    # Robust instantiation across config parameter order
-    try:
-        agent = MuZeroAgent(cfg, env.observation_space.shape)
-    except TypeError:
-        try:
-            agent = MuZeroAgent(obs_shape=env.observation_space.shape, cfg=cfg)
-        except TypeError:
-            agent = MuZeroAgent(cfg=cfg)
-
-    device = getattr(agent, 'device', torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-
-    # Robust loading across network structure variations
-    if hasattr(agent, 'network'):
-        agent.network.load_state_dict(checkpoint)
-    elif hasattr(agent, 'load_checkpoint'):
-        agent.load_checkpoint(checkpoint_path)
-    else:
-        agent.load_state_dict(checkpoint)
-
-    print(f"Loaded MuZero checkpoint: {checkpoint_path}")
-
-    def action_fn(obs):
-        try:
-            res = agent.select_action(obs, temperature=0.0, add_exploration_noise=False)
-        except TypeError:
-            try:
-                res = agent.select_action(obs, eval_mode=True)
-            except TypeError:
-                res = agent.select_action(obs)
-        return res[0] if isinstance(res, (tuple, list)) else res
-
-    return run_episode(env, action_fn)
-
-
-def evaluate_ppo(df, checkpoint_path):
-    if not checkpoint_path or not os.path.exists(checkpoint_path):
-        raise FileNotFoundError(
-            f"No PPO checkpoint found ({checkpoint_path}). Aborting rather than "
-            f"evaluating an untrained network. Train one first with `python main_ppo.py`."
-        )
-
-    env = StockTradingEnv(df, use_dsr=True)
-    action_dim = getattr(env, 'action_dim', getattr(env, 'n_actions', getattr(getattr(env, 'action_space', None), 'n', 3)))
-    
-    agent = PPOAgent(obs_shape=env.observation_space.shape, action_dim=action_dim)
-    device = getattr(agent, 'device', torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
-    
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    if hasattr(agent, 'policy'):
-        agent.policy.load_state_dict(checkpoint)
-    else:
-        agent.load_state_dict(checkpoint)
-
-    print(f"Loaded PPO checkpoint: {checkpoint_path}")
-
-    def action_fn(obs):
-        try:
-            res = agent.select_action(obs, deterministic=True)
-        except TypeError:
-            res = agent.select_action(obs)
-        return res[0] if isinstance(res, (tuple, list)) else res
-
-    return run_episode(env, action_fn)
-
-
-def evaluate_buy_and_hold(df):
-    env = StockTradingEnv(df, use_dsr=False)
-    return run_episode(env, action_fn=lambda obs: 2)  # always Long
-
-
 def export_equity_and_positions(name, df, portfolio_history, position_history, step_indices,
                                   split, out_dir="logs/evaluation"):
     """
-    Saves the FULL per-step equity curve and position/exposure history to CSV.
-    Ensures all output fields match step count N exactly.
+    Saves the FULL per-step equity curve and position/exposure history to
+    CSV -- what actually shows whether a strategy generated wealth across
+    the full period, not just its final number.
+
+    Aligns by the SHORTEST of {step_indices, position_history,
+    portfolio_history[1:]} rather than assuming they're already equal
+    length -- StockTradingEnv.step()'s terminal step can append to
+    position_history/step_indices one more time than there are real
+    aligned dates/portfolio values remaining, which previously caused
+    "All arrays must be of the same length" here.
     """
     os.makedirs(out_dir, exist_ok=True)
 
-    n_steps = len(position_history)
+    n = min(len(step_indices), len(position_history), len(portfolio_history) - 1)
 
-    # Date alignment with safety fallback
-    if 'date' in df.columns:
-        dates = df['date'].iloc[step_indices].reset_index(drop=True)
-    elif 'Date' in df.columns:
-        dates = df['Date'].iloc[step_indices].reset_index(drop=True)
-    else:
-        dates = pd.Series(step_indices)
-
-    # Align portfolio values to step count N (drops initial capital at index 0)
-    if len(portfolio_history) == n_steps + 1:
-        port_vals = portfolio_history[1:]
-    else:
-        port_vals = portfolio_history[-n_steps:]
+    dates = df['date'].iloc[step_indices[:n]].reset_index(drop=True)
+    trimmed_positions = position_history[:n]
 
     out_df = pd.DataFrame({
         "date": dates,
-        "portfolio_value": port_vals,
-        "position_action": position_history,
-        "position_label": [ACTION_NAMES[a] for a in position_history],
-        "exposure_pct": [POSITION_EXPOSURE_PCT[a] for a in position_history],
+        "portfolio_value": portfolio_history[1:1 + n],
+        "position_action": trimmed_positions,
+        "position_label": [ACTION_NAMES[a] for a in trimmed_positions],
+        "exposure_pct": [POSITION_EXPOSURE_PCT[a] for a in trimmed_positions],
     })
 
     out_path = os.path.join(out_dir, f"{split}_{name.lower().replace(' ', '_')}_equity.csv")
@@ -205,6 +212,8 @@ def export_equity_and_positions(name, df, portfolio_history, position_history, s
 
 
 def plot_equity_comparison(equity_dfs: dict, split, out_dir="logs/evaluation"):
+    """Overlays every evaluated agent's + benchmark's equity curve on one
+    chart, over real calendar dates."""
     plt.figure(figsize=(11, 5))
     for name, edf in equity_dfs.items():
         plt.plot(pd.to_datetime(edf['date']), edf['portfolio_value'], label=name, linewidth=1.6)
@@ -223,6 +232,7 @@ def plot_equity_comparison(equity_dfs: dict, split, out_dir="logs/evaluation"):
 
 
 def plot_exposure_over_time(name, equity_df, split, out_dir="logs/evaluation"):
+    """Position/exposure over time for ONE agent."""
     plt.figure(figsize=(11, 2.5))
     plt.step(pd.to_datetime(equity_df['date']), equity_df['exposure_pct'], where='post', linewidth=1.2)
     plt.title(f"{name} — Exposure Over Time ({split} split)")
@@ -239,7 +249,7 @@ def plot_exposure_over_time(name, equity_df, split, out_dir="logs/evaluation"):
     print(f"  Saved exposure chart: {out_path}")
 
 
-def print_report(name, portfolio_history, action_counts):
+def print_report(name, portfolio_history, action_counts, risk_overrides=0):
     metrics = compute_all_metrics(portfolio_history)
     dist = action_distribution_pct(action_counts)
 
@@ -250,6 +260,8 @@ def print_report(name, portfolio_history, action_counts):
     worst_day = worst_single_period_loss(portfolio_history)
     print(f"  Annualised Volatility : {vol:.2%}")
     print(f"  Worst Single-Step Loss: {worst_day:.2%}")
+    if risk_overrides:
+        print(f"  Risk Overrides        : {risk_overrides} steps forced flat")
 
     return metrics
 
@@ -264,6 +276,12 @@ def main():
                               "instead, or let both auto-detect.")
     parser.add_argument("--muzero-ckpt", default=None, help="Override MuZero checkpoint path.")
     parser.add_argument("--ppo-ckpt", default=None, help="Override PPO checkpoint path.")
+    parser.add_argument("--max-drawdown", type=float, default=None,
+                         help="Enable the RiskManager kill-switch overlay (e.g. 0.15 for 15%%), "
+                              "applied to MuZero/PPO only. Disabled by default.")
+    parser.add_argument("--cooldown-steps", type=int, default=5,
+                         help="Steps to stay forced-flat after a kill-switch trigger. "
+                              "Only used if --max-drawdown is set.")
     args = parser.parse_args()
 
     df = load_split(args.split)
@@ -284,19 +302,21 @@ def main():
     equity_dfs = {}
 
     if args.agent in ("muzero", "all"):
-        history, counts, positions, steps = evaluate_muzero(df, muzero_ckpt)
-        results["MuZero"] = print_report("MuZero", history, counts)
+        mz_risk = RiskManager(max_drawdown=args.max_drawdown, cooldown_steps=args.cooldown_steps) if args.max_drawdown else None
+        history, counts, positions, steps, overrides = evaluate_muzero(df, muzero_ckpt, risk_manager=mz_risk)
+        results["MuZero"] = print_report("MuZero", history, counts, risk_overrides=overrides)
         equity_dfs["MuZero"] = export_equity_and_positions("MuZero", df, history, positions, steps, args.split)
         plot_exposure_over_time("MuZero", equity_dfs["MuZero"], args.split)
 
     if args.agent in ("ppo", "all"):
-        history, counts, positions, steps = evaluate_ppo(df, ppo_ckpt)
-        results["PPO"] = print_report("PPO", history, counts)
+        ppo_risk = RiskManager(max_drawdown=args.max_drawdown, cooldown_steps=args.cooldown_steps) if args.max_drawdown else None
+        history, counts, positions, steps, overrides = evaluate_ppo(df, ppo_ckpt, risk_manager=ppo_risk)
+        results["PPO"] = print_report("PPO", history, counts, risk_overrides=overrides)
         equity_dfs["PPO"] = export_equity_and_positions("PPO", df, history, positions, steps, args.split)
         plot_exposure_over_time("PPO", equity_dfs["PPO"], args.split)
 
     if args.agent in ("buy_and_hold", "all"):
-        history, counts, positions, steps = evaluate_buy_and_hold(df)
+        history, counts, positions, steps, _ = evaluate_buy_and_hold(df)
         results["Buy-and-Hold"] = print_report("Buy-and-Hold", history, counts)
         equity_dfs["Buy-and-Hold"] = export_equity_and_positions(
             "Buy-and-Hold", df, history, positions, steps, args.split

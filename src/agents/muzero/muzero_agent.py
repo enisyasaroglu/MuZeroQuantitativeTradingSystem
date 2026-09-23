@@ -150,6 +150,7 @@ class MuZeroAgent:
                         action = int(np.random.choice(self.action_dim, p=play_policy))
 
             return action, probs, root.value()
+    
 
     def update(self, batch, k_steps=None):
         """
@@ -183,6 +184,7 @@ class MuZeroAgent:
         value_w = getattr(cfg, "value_loss_weight", 0.25)
         policy_w = getattr(cfg, "policy_loss_weight", 1.0)
         reward_w = getattr(cfg, "reward_loss_weight", 1.0)
+        entropy_w = getattr(cfg, "entropy_loss_weight", 0.01)
         grad_scale = getattr(cfg, "hidden_state_grad_scale", 0.5)
         clip_norm = getattr(cfg, "grad_clip_norm", 5.0)
 
@@ -190,8 +192,7 @@ class MuZeroAgent:
         hidden_state = self.network.representation(observations)
 
         total_loss = 0.0
-        loss_components = {"value": 0.0, "policy": 0.0, "reward": 0.0}
-
+        loss_components = {"value": 0.0, "policy": 0.0, "reward": 0.0, "entropy": 0.0}
         scale = 1.0 / k_steps
 
         for k in range(k_steps):
@@ -201,13 +202,19 @@ class MuZeroAgent:
             t_pol = target_policies[:, k, :]
 
             loss_value = torch.mean((pred_value - t_val) ** 2)
-            loss_policy = torch.sum(
-                -t_pol * torch.nn.functional.log_softmax(pred_logits, dim=1), dim=1
-            ).mean()
+            log_probs = torch.nn.functional.log_softmax(pred_logits, dim=1)
+            probs = torch.softmax(pred_logits, dim=1)
+            
+            loss_policy_ce = torch.sum(-t_pol * log_probs, dim=1).mean()
+            policy_entropy = -torch.sum(probs * log_probs, dim=1).mean()
+            
+            # Subtract weighted entropy to maximize policy variance
+            loss_policy = loss_policy_ce - (entropy_w * policy_entropy)
 
             total_loss = total_loss + scale * (value_w * loss_value + policy_w * loss_policy)
             loss_components["value"] += scale * loss_value.item()
             loss_components["policy"] += scale * loss_policy.item()
+            loss_components["entropy"] += scale * policy_entropy.item()
 
             if k < k_steps - 1:
                 real_action = action_sequence[:, k].unsqueeze(1)  # (Batch, 1)
@@ -233,3 +240,29 @@ class MuZeroAgent:
         self.network.optimizer.step()
 
         return total_loss.item(), loss_components
+    
+    
+# --- Module-level Checkpoint Utilities ---
+
+def load_muzero_checkpoint(agent: MuZeroAgent, checkpoint_path: str) -> MuZeroAgent:
+    """
+    Loads a saved checkpoint's weights into agent.network in place.
+    """
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(
+            f"MuZero checkpoint not found: {checkpoint_path}. "
+            f"Train one first with `python main_muzero.py`."
+        )
+
+    state_dict = torch.load(checkpoint_path, map_location=agent.device)
+    agent.network.load_state_dict(state_dict)
+    agent.network.eval()
+    return agent
+
+
+def save_muzero_checkpoint(agent: MuZeroAgent, checkpoint_path: str):
+    """
+    Saves the current weights of agent.network to a checkpoint file.
+    """
+    os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
+    torch.save(agent.network.state_dict(), checkpoint_path)
