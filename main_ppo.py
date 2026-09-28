@@ -20,6 +20,7 @@ from configs.ppo_config import ppo_config
 from src.env.trading_env import StockTradingEnv
 from src.agents.ppo.ppo_agent import PPOAgent
 from utils.dashboard_logger import QuantRLLogger
+from src.utils.schedules import entropy_coef_schedule
 
 def run_ppo(num_episodes=500, checkpoint_every=5):
     data_path = os.path.join('data', 'processed', 'train_data.csv')
@@ -52,6 +53,7 @@ def run_ppo(num_episodes=500, checkpoint_every=5):
     for episode in range(1, num_episodes + 1):
         state, _ = env.reset()
         memory = {'states': [], 'actions': [], 'log_probs': [], 'values': [], 'rewards': [], 'dones': []}
+        agent.entropy_coef = entropy_coef_schedule(episode, num_episodes)
         
         # Track full trajectory metrics for quantitative log calculations
         portfolio_history = [getattr(env, 'portfolio_value', 100000.0)]
@@ -75,8 +77,12 @@ def run_ppo(num_episodes=500, checkpoint_every=5):
 
             state = next_state
 
-        # Update policy and extract losses
-        policy_loss, value_loss, _ = agent.update(memory)
+        # Update policy and extract losses. Third value is mean policy
+        # entropy (Categorical(logits).entropy().mean(), computed in
+        # PPOAgent.update()) -- previously discarded here via `_`, now
+        # passed through to the dashboard, matching main_muzero.py's
+        # already-correct handling of MuZero's own policy entropy.
+        policy_loss, value_loss, policy_entropy = agent.update(memory)
 
         # Refresh single live table in terminal
         logger.log_cycle(
@@ -84,7 +90,8 @@ def run_ppo(num_episodes=500, checkpoint_every=5):
             portfolio_values=portfolio_history,
             daily_returns=daily_returns,
             policy_loss=policy_loss,
-            value_loss=value_loss
+            value_loss=value_loss,
+            policy_entropy=policy_entropy
         )
 
         # Save model checkpoints periodically without printing table duplicates

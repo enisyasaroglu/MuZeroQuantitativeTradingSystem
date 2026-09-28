@@ -54,7 +54,7 @@ def test_environment_random_run():
     env = StockTradingEnv(df)
 
     obs, info = env.reset()
-    assert obs.shape == (env.lookback, env.n_features), "Observation shape mismatch!"
+    assert obs.shape == env.observation_space.shape, "Observation shape mismatch!"
 
     done = False
     step = 0

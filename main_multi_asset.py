@@ -8,8 +8,7 @@ the MCTS or network code are needed -- only `action_space_dim` /
 `action_dim` need to be set to env.n_actions instead of 3.
 
 Usage:
-    python src/pipeline/processor.py --multi-asset   # (see processor.py __main__ for the flag,
-                                                       #  or call process_multi_asset() directly)
+    python src/pipeline/processor.py --multi-asset
     python main_multi_asset.py --agent muzero
     python main_multi_asset.py --agent ppo
 """
@@ -41,20 +40,14 @@ def load_multi_asset_split(split="train"):
 def train_muzero(num_episodes=20):
     df = load_multi_asset_split("train")
 
-    # use_dsr=False: with DSR active, this environment's reward has the
-    # SAME property already proven (mathematically, then empirically via
-    # a completed 500-episode run) to make "do nothing" strictly dominant
-    # once the running-average return goes negative -- whenever A < 0,
-    # a net_return of ~0 scores better than continuing to trade, with no
-    # downside risk, regardless of whether standing aside is actually the
-    # right call. In this environment, action 0 (all-cash) is that same
-    # "do nothing" escape hatch. This is the identical reward mechanism
-    # already fixed in main_muzero.py, not a new hypothesis -- applying
-    # the same established fix here rather than re-testing it.
+    # use_dsr=False: with DSR active, "do nothing" (here, action 0 =
+    # all-cash) becomes strictly dominant once the running-average return
+    # goes negative -- the same proven freeze already fixed in
+    # main_muzero.py.
     env = MultiAssetTradingEnv(df, use_dsr=False)
 
     config = MuZeroConfig()
-    config.action_space_dim = env.n_actions  # only change needed vs. single-asset training
+    config.action_space_dim = env.n_actions
 
     agent = MuZeroAgent(config, env.observation_space.shape)
     buffer = ReplayBuffer(capacity=500, batch_size=config.batch_size,
@@ -94,9 +87,9 @@ def train_muzero(num_episodes=20):
 
         buffer.save_game(game_history)
 
-        policy_loss, value_loss = 0.0, 0.0
+        policy_loss, value_loss, policy_entropy = 0.0, 0.0, 0.0
         if buffer.size() >= config.batch_size:
-            total_policy_loss, total_value_loss = 0.0, 0.0
+            total_policy_loss, total_value_loss, total_entropy = 0.0, 0.0, 0.0
             num_updates = 10
             for _ in range(num_updates):
                 batch = buffer.sample_batch()
@@ -104,21 +97,29 @@ def train_muzero(num_episodes=20):
                 if isinstance(loss_components, dict):
                     total_policy_loss += float(loss_components.get('policy', loss_out))
                     total_value_loss += float(loss_components.get('value', 0.0))
+                    total_entropy += float(loss_components.get('entropy', 0.0))
                 else:
                     total_policy_loss += float(loss_out)
             policy_loss = total_policy_loss / num_updates
             value_loss = total_value_loss / num_updates
+            policy_entropy = total_entropy / num_updates
 
         logger.log_cycle(
             cycle=episode,
             portfolio_values=portfolio_history,
             daily_returns=daily_returns,
             policy_loss=policy_loss,
-            value_loss=value_loss
+            value_loss=value_loss,
+            policy_entropy=policy_entropy
         )
 
         if episode % 5 == 0:
-            save_path = os.path.join('src', 'models', f'muzero_multiasset_checkpoint_{episode}.pth')
+            # src/checkpoints, matching every other training script and
+            # evaluate.py (was src/models). The "muzero_multiasset_"
+            # prefix is deliberately distinct from "muzero_checkpoint_",
+            # so evaluate.py's single-asset auto-detection can never
+            # pick these up by accident.
+            save_path = os.path.join('src', 'checkpoints', f'muzero_multiasset_checkpoint_{episode}.pth')
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
             torch.save(agent.network.state_dict(), save_path)
 
@@ -128,15 +129,7 @@ def train_muzero(num_episodes=20):
 def train_ppo(num_episodes=50):
     df = load_multi_asset_split("train")
 
-    # use_dsr=False: base_config.py's USE_DSR_REWARD defaults to True.
-    # Without this override, PPO's multi-asset training reward was
-    # silently DSR-shaped while the PnL/Sharpe shown in this dashboard
-    # are computed from net_return -- the same DSR-vs-raw-return
-    # mismatch already fixed for MuZero in train_muzero() above, never
-    # previously checked for PPO's multi-asset path specifically. This
-    # is one plausible contributor to the -75.51% multi-asset average
-    # return -- confirmed as a real mismatch, not yet confirmed as the
-    # full explanation for that magnitude.
+    # use_dsr=False: same reward fix as train_muzero above and main_ppo.py.
     env = MultiAssetTradingEnv(df, use_dsr=False)
 
     agent = PPOAgent(obs_shape=env.observation_space.shape, action_dim=env.n_actions)
@@ -173,24 +166,20 @@ def train_ppo(num_episodes=50):
 
             state = next_state
 
-        update_result = agent.update(memory)
-        if isinstance(update_result, tuple):
-            if len(update_result) == 3:
-                policy_loss, value_loss, _ = update_result
-            elif len(update_result) == 2:
-                policy_loss, _ = update_result
-                value_loss = 0.0
-            else:
-                policy_loss, value_loss = update_result[0], update_result[1]
-        else:
-            policy_loss, value_loss = float(update_result), 0.0
+        # Direct 3-tuple unpack, matching main_ppo.py. The previous
+        # len()-based fallback silently set value_loss = 0.0 on a
+        # mismatched return shape -- the exact mechanism that hid the
+        # Value Loss bug earlier. If update()'s return shape ever
+        # changes, this should fail loudly instead.
+        policy_loss, value_loss, policy_entropy = agent.update(memory)
 
         logger.log_cycle(
             cycle=episode,
             portfolio_values=portfolio_history,
             daily_returns=daily_returns,
             policy_loss=policy_loss,
-            value_loss=value_loss
+            value_loss=value_loss,
+            policy_entropy=policy_entropy
         )
 
         if episode % 10 == 0:

@@ -130,7 +130,11 @@ def ucb_score(config, parent, child, min_max_stats):
     pb_c *= math.sqrt(parent.visit_count) / (child.visit_count + 1)
 
     prior_score = pb_c * child.prior
-    value_score = min_max_stats.normalize(child.value())
+    if child.visit_count > 0:
+        q = child.reward + config.discount_factor * child.value()
+        value_score = min_max_stats.normalize(q)
+    else:
+        value_score = 0.0
     
     return prior_score + value_score
 
@@ -139,7 +143,7 @@ def backpropagate(search_path, value, discount, min_max_stats):
     for node in reversed(search_path):
         node.value_sum += value
         node.visit_count += 1
-        min_max_stats.update(node.value())
+        min_max_stats.update(node.reward + discount * node.value())
         
         # Value for parent = Reward + Discount * Value
         value = node.reward + discount * value

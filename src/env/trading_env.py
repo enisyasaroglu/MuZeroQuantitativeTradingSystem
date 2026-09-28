@@ -71,7 +71,7 @@ class StockTradingEnv(gym.Env):
 
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf,
-            shape=(self.lookback, self.n_features),
+            shape=(self.lookback, self.n_features+1),
             dtype=np.float32
         )
 
@@ -181,8 +181,9 @@ class StockTradingEnv(gym.Env):
         """
         Returns the window of features ending at current_step.
         """
-        obs = self.df.iloc[self.current_step - self.lookback: self.current_step][self.feature_cols]
-        return obs.values.astype(np.float32)
+        window = self.df.iloc[self.current_step - self.lookback: self.current_step][self.feature_cols]
+        position = np.full((self.lookback, 1), self.current_action - 1, dtype=np.float32)
+        return np.concatenate([window.values.astype(np.float32), position], axis=1)
 
     def render(self):
         print(f"Step: {self.current_step}, Position: {self.current_action}, "

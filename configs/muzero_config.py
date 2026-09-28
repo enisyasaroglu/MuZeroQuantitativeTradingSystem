@@ -23,7 +23,7 @@ class MuZeroConfig:
     batch_size: int = 64
     discount_factor: float = 0.99 
     weight_decay: float = 1e-4      # L2 Regularization
-    entropy_loss_weight: float = 0.01  # Encourage exploration
+    entropy_loss_weight: float = 0.05  # Encourage exploration
 
     # 4. MCTS Specifics (The "Brain" Settings)
     num_simulations: int = 150       # Reduce from 800 to 50 for speed 
