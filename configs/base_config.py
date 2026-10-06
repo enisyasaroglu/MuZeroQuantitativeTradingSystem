@@ -3,7 +3,7 @@ from dataclasses import dataclass
 @dataclass
 class ProjectConfig:
     # Data Settings
-    TICKER: str = "^GSPC"     # S&P 500
+    TICKER: str = "SPY"     # S&P 500
     START_DATE: str = "2015-01-01"
     END_DATE: str = "2023-01-01"
 
@@ -13,8 +13,8 @@ class ProjectConfig:
     # validation/test cannot contain any feature computed from a rolling
     # window that crosses back into the previous split's price data.
     TRAIN_SPLIT: float = 0.70
-    VAL_SPLIT: float = 0.15   # remaining 0.15 is TEST
-    EMBARGO_DAYS: int = 60
+    VAL_SPLIT: float = 0.15   
+    TEST_SPLIT: float = 0.15
 
     # Environment Settings
     INITIAL_CAPITAL: float = 100000.0
@@ -28,6 +28,10 @@ class ProjectConfig:
     DSR_ETA: float = 0.01
     DSR_WARMUP_STEPS: int = 5
     DSR_CLIP: float = 10.0
+    
+    # Risk halt inside the env. 1.0 = disabled (the halt cannot trigger).
+    MAX_DRAWDOWN: float = 1.0
+    MAX_DAILY_LOSS: float = 1.0
 
     # Feature Engineering
     # stockstats naming convention:
@@ -42,5 +46,17 @@ class ProjectConfig:
     TECH_INDICATORS: tuple = (
         "macd", "rsi_14", "rsi_30", "cci_14", "dx_30", "atr_30", "boll_ub", "boll_lb"
     )
+    
+    # Reproducibility
+    SEED: int = 42
+    
+    def __post_init__(self):
+        if not 0.0 < self.TRAIN_SPLIT + self.VAL_SPLIT < 1.0:
+            raise ValueError("TRAIN_SPLIT + VAL_SPLIT must be strictly between 0 and 1")
+
+    @property
+    def EMBARGO_DAYS(self) -> int:
+        # Must equal the lookback so no rolling window crosses a split.
+        return self.LOOKBACK_WINDOW
 
 config = ProjectConfig()

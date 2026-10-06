@@ -1,40 +1,70 @@
 from dataclasses import dataclass
 
-@dataclass
+
+@dataclass(frozen=True)
 class MuZeroConfig:
-    # 1. Environment & Data Settings
-    stock_symbol: str = "SPY"       # S&P 500 ETF or ^GSPC
-    window_size: int = 60           # Lookback window T=60 
-    start_date: str = "2015-01-01"
-    end_date: str = "2021-01-01"    # Training Data
-    test_start_date: str = "2021-01-02" # Out of sample
-    
-    # Market Mechanics
-    transaction_fee: float = 0.001  # 0.1% per trade 
-    initial_capital: float = 100000.0
+    """
+    Configuration for the MuZero quantitative trading agent.
 
-    # 2. Network Architecture
-    latent_state_dim: int = 64      # Size of hidden state s_t
-    action_space_dim: int = 3       # 0=Short, 1=Neutral, 2=Long 
-    hidden_size: int = 64           # Neurons in MLP layers
-    
-    # 3. Training Hyperparameters
-    learning_rate: float = 0.0003
+    All experiment/training parameters should live here rather than
+    being hard-coded inside the training script.
+    """
+
+    # Reproducibility
+    seed: int = 42
+
+    # Network architecture
+    latent_state_dim: int = 64
+    hidden_size: int = 64
+    action_space_dim: int = 3
+
+    # Optimisation
+    learning_rate: float = 3e-4
+    weight_decay: float = 1e-4
+
     batch_size: int = 64
-    discount_factor: float = 0.99 
-    weight_decay: float = 1e-4      # L2 Regularization
-    entropy_loss_weight: float = 0.05  # Encourage exploration
 
-    # 4. MCTS Specifics (The "Brain" Settings)
-    num_simulations: int = 150       # Reduce from 800 to 50 for speed 
-    
-    # Root Noise (Exploration)
+    # Discounting
+    discount_factor: float = 0.99
+
+    # Loss weights
+    value_loss_weight: float = 0.25
+    policy_loss_weight: float = 1.0
+    reward_loss_weight: float = 1.0
+    entropy_loss_weight: float = 0.05
+
+    # MuZero unroll / target construction
+    unroll_steps: int = 5
+    td_steps: int = 5
+
+    # Maximum number of environment steps in one training episode.
+    episode_length: int = 252
+
+    # Replay buffer
+    replay_buffer_capacity: int = 2000
+
+    # Number of games/trajectories that must exist before learning starts.
+    min_buffer_size: int = 10
+
+    # Training
+    num_episodes: int = 500
+    updates_per_episode: int = 10
+
+    # Gradient control
+    hidden_state_grad_scale: float = 0.5
+    grad_clip_norm: float = 5.0
+
+    # MCTS
+    num_simulations: int = 150
+
     root_dirichlet_alpha: float = 0.3
     root_exploration_fraction: float = 0.25
-    
-    # UCB Score Formula Constants (Standard MuZero values)
+
     pb_c_base: int = 19652
     pb_c_init: float = 1.25
 
-    # Training Hyperparameters
-    unroll_steps: int = 5             # Reduce from 5 to 3 for faster training
+    # Checkpointing
+    checkpoint_every: int = 5
+
+
+muzero_config = MuZeroConfig()

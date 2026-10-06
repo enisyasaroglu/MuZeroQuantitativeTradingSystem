@@ -51,6 +51,38 @@ def test_muzero_flow():
     assert next_policy.shape == (batch_size, action_dim)
     
     print("\nSuccess! All MuZero components connect correctly.")
+    
+    # Numerical stability
+    for output in (
+        hidden_state,
+        policy,
+        value,
+        next_hidden,
+        reward,
+        next_policy,
+        next_value,
+    ):
+        assert torch.isfinite(output).all()
+
+    # Latent-state bounds
+    assert hidden_state.abs().max() <= 1.0
+    assert next_hidden.abs().max() <= 1.0
+
+    # Gradient propagation
+    loss = (
+        policy.square().mean()
+        + value.square().mean()
+        + reward.square().mean()
+        + next_policy.square().mean()
+        + next_value.square().mean()
+    )
+
+    loss.backward()
+
+    assert any(
+        p.grad is not None and torch.isfinite(p.grad).all()
+        for p in rep_net.parameters()
+    )
 
 if __name__ == "__main__":
     test_muzero_flow()

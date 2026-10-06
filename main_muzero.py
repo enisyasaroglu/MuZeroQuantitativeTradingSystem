@@ -3,6 +3,7 @@ import pandas as pd
 import torch
 import random
 
+from configs.base_config import ProjectConfig
 from configs.muzero_config import MuZeroConfig
 from src.env.trading_env import StockTradingEnv
 from src.agents.muzero.muzero_agent import MuZeroAgent
@@ -14,6 +15,7 @@ from utils.dashboard_logger import QuantRLLogger
 
 def run_muzero():
     config = MuZeroConfig()
+    project_config = ProjectConfig()
     
     data_path = os.path.join('data', 'processed', 'train_data.csv')
     if not os.path.exists(data_path):
@@ -21,7 +23,11 @@ def run_muzero():
         return
     df = pd.read_csv(data_path)
     
-    env = StockTradingEnv(df, use_dsr=False, window_size=252)
+    env = StockTradingEnv(
+        df, 
+        use_dsr=False, 
+        window_size=config.episode_length
+        )
     obs_shape = env.observation_space.shape
     
     agent = MuZeroAgent(config, obs_shape)
@@ -30,14 +36,15 @@ def run_muzero():
         capacity=2000,
         batch_size=config.batch_size, 
         unroll_steps=config.unroll_steps,
-        discount=config.discount_factor
+        discount=config.discount_factor,
+        td_steps=config.unroll_steps
     )
     
     num_episodes = 500
 
     logger = QuantRLLogger(
         agent_name="MuZero",
-        asset_symbol=getattr(config, 'stock_symbol', 'SPY'),
+        asset_symbol=project_config.TICKER,
         total_episodes=num_episodes
     )
     
@@ -88,13 +95,7 @@ def run_muzero():
             successful_updates = 0
             
             for _ in range(num_updates):
-                try:
-                    batch = buffer.sample_batch()
-                except Exception:
-                    batch = None
-                
-                if batch is None:
-                    continue
+                batch = buffer.sample_batch()
 
                 loss_out, loss_components = agent.update(batch, k_steps=config.unroll_steps)
                 successful_updates += 1
@@ -125,11 +126,13 @@ def run_muzero():
         )
         
         if episode % 5 == 0:
-            save_path = os.path.join('src', 'checkpoints', f'muzero_checkpoint_{episode}.pth')
+            save_path = os.path.join('checkpoints', f'muzero_checkpoint_{episode}.pth')
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
             torch.save(agent.network.state_dict(), save_path)
 
     logger.stop_dashboard()
 
 if __name__ == "__main__":
+    config = MuZeroConfig()
+    project_config = ProjectConfig()
     run_muzero()

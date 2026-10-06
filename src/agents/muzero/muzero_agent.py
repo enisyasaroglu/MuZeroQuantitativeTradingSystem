@@ -123,9 +123,17 @@ class MuZeroAgent:
                              add_exploration_noise=add_exploration_noise)
             
             # 4. Extract Visit Counts (The 'Policy')
-            visit_counts = [root.children[a].visit_count if a in root.children else 0 
-                            for a in range(self.action_dim)]
-            
+            visit_counts = [
+                root.children[a].visit_count if a in root.children else 0
+                for a in range(self.action_dim)
+            ]
+
+            print(
+                f"MCTS visits: Short={visit_counts[0]}, "
+                f"Neutral={visit_counts[1]}, "
+                f"Long={visit_counts[2]}"
+            )
+
             sum_visits = sum(visit_counts)
             
             if sum_visits == 0:
@@ -243,7 +251,6 @@ class MuZeroAgent:
     
     
 # --- Module-level Checkpoint Utilities ---
-
 def load_muzero_checkpoint(agent: MuZeroAgent, checkpoint_path: str) -> MuZeroAgent:
     """
     Loads a saved checkpoint's weights into agent.network in place.
@@ -254,7 +261,11 @@ def load_muzero_checkpoint(agent: MuZeroAgent, checkpoint_path: str) -> MuZeroAg
             f"Train one first with `python main_muzero.py`."
         )
 
-    state_dict = torch.load(checkpoint_path, map_location=agent.device)
+    state_dict = torch.load(
+        checkpoint_path,
+        map_location=agent.device,
+        weights_only=True,
+    )
     agent.network.load_state_dict(state_dict)
     agent.network.eval()
     return agent

@@ -1,108 +1,107 @@
-"""
-PPO baseline training entry point.
-
-NOTE: an earlier version of this file was an exact byte-for-byte
-duplicate of main_muzero.py -- running `python main_ppo.py` actually
-trained and checkpointed a MuZero agent under a PPO-labelled filename,
-and every PPO figure evaluated from those checkpoints was really MuZero.
-This was compounded by a second bug in evaluate.py's `--agent all` mode
-never loading a checkpoint for either agent (see evaluate.py), so no
-"PPO" result produced by this project before both fixes reflected an
-actually-trained PPO policy. This file now genuinely implements PPO
-training using PPOAgent, matching the interface already used correctly
-in main_multi_asset.py's train_ppo().
-"""
+import argparse
 import os
+import random
+
+import numpy as np
 import pandas as pd
 import torch
 
+from configs.base_config import config
 from configs.ppo_config import ppo_config
 from src.env.trading_env import StockTradingEnv
 from src.agents.ppo.ppo_agent import PPOAgent
 from utils.dashboard_logger import QuantRLLogger
 from src.utils.schedules import entropy_coef_schedule
 
-def run_ppo(num_episodes=500, checkpoint_every=5):
-    data_path = os.path.join('data', 'processed', 'train_data.csv')
-    if not os.path.exists(data_path):
-        print("Data not found!")
-        return
-    df = pd.read_csv(data_path)
+EPISODE_LENGTH = 252        # same as MuZero's episode_length
+EPISODES_PER_UPDATE = 8     # about 2,000 steps per PPO update
 
-    # use_dsr=False: main_muzero.py already has this, with the DSR-freeze
-    # pathology proven and documented there. This file was missing it --
-    # the exact same reward mechanism applies to PPO's training, since
-    # both agents share StockTradingEnv/DifferentialSharpeRatio. Very
-    # likely the cause of the flat, single-action-then-frozen equity
-    # curve seen in evaluate.py's deterministic PPO result.
-    env = StockTradingEnv(df, use_dsr=False, window_size=252)
-    action_dim = getattr(env, 'action_dim', getattr(env, 'n_actions', getattr(getattr(env, 'action_space', None), 'n', 3)))
-    
-    # Initialize PPOAgent with explicit configuration object
-    agent = PPOAgent(obs_shape=env.observation_space.shape, action_dim=action_dim, cfg=ppo_config)
-    
-    logger = QuantRLLogger(
-        agent_name="PPO",
-        asset_symbol="SPY",
-        total_episodes=num_episodes
-    )
-    
-    # Start the live dashboard interface
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+
+def new_memory():
+    return {'states': [], 'actions': [], 'log_probs': [],
+            'values': [], 'rewards': [], 'dones': []}
+
+
+def run_ppo(num_episodes=500, checkpoint_every=5,
+            data_path=os.path.join('data', 'processed', 'train_data.csv'),
+            checkpoint_dir='checkpoints'):
+    if not os.path.exists(data_path):
+        raise FileNotFoundError(f"Data not found: {data_path}")
+
+    set_seed(config.SEED)
+    df = pd.read_csv(data_path)
+    asset = str(df['tic'].iloc[0]) if 'tic' in df.columns else config.TICKER
+
+    env = StockTradingEnv(df, use_dsr=False, window_size=EPISODE_LENGTH)
+    agent = PPOAgent(obs_shape=env.observation_space.shape,
+                     action_dim=env.action_space.n, cfg=ppo_config)
+
+    logger = QuantRLLogger(agent_name="PPO", asset_symbol=asset,
+                           total_episodes=num_episodes)
     logger.start_dashboard()
 
-    for episode in range(1, num_episodes + 1):
-        state, _ = env.reset()
-        memory = {'states': [], 'actions': [], 'log_probs': [], 'values': [], 'rewards': [], 'dones': []}
-        agent.entropy_coef = entropy_coef_schedule(episode, num_episodes)
-        
-        # Track full trajectory metrics for quantitative log calculations
-        portfolio_history = [getattr(env, 'portfolio_value', 100000.0)]
-        daily_returns = []
-        done = False
+    memory = new_memory()
+    policy_loss = value_loss = policy_entropy = 0.0
 
-        while not done:
-            action, log_prob, value = agent.select_action(state)
-            next_state, reward, terminated, truncated, info = env.step(action)
-            done = terminated or truncated
+    try:
+        for episode in range(1, num_episodes + 1):
+            state, _ = env.reset(seed=config.SEED if episode == 1 else None)
+            agent.entropy_coef = entropy_coef_schedule(episode, num_episodes)
 
-            memory['states'].append(state)
-            memory['actions'].append(action)
-            memory['log_probs'].append(log_prob)
-            memory['values'].append(value)
-            memory['rewards'].append(reward)
-            memory['dones'].append(done)
+            portfolio_history = [env.portfolio_value]
+            daily_returns = []
+            done = False
 
-            portfolio_history.append(getattr(env, 'portfolio_value', 100000.0))
-            daily_returns.append(info.get('net_return', reward))
+            while not done:
+                action, log_prob, value = agent.select_action(state)
+                next_state, reward, terminated, truncated, info = env.step(action)
+                done = terminated or truncated
 
-            state = next_state
+                memory['states'].append(state)
+                memory['actions'].append(action)
+                memory['log_probs'].append(log_prob)
+                memory['values'].append(value)
+                memory['rewards'].append(reward)
+                memory['dones'].append(done)
 
-        # Update policy and extract losses. Third value is mean policy
-        # entropy (Categorical(logits).entropy().mean(), computed in
-        # PPOAgent.update()) -- previously discarded here via `_`, now
-        # passed through to the dashboard, matching main_muzero.py's
-        # already-correct handling of MuZero's own policy entropy.
-        policy_loss, value_loss, policy_entropy = agent.update(memory)
+                portfolio_history.append(env.portfolio_value)
+                daily_returns.append(info.get('net_return', reward))
+                state = next_state
 
-        # Refresh single live table in terminal
-        logger.log_cycle(
-            cycle=episode,
-            portfolio_values=portfolio_history,
-            daily_returns=daily_returns,
-            policy_loss=policy_loss,
-            value_loss=value_loss,
-            policy_entropy=policy_entropy
-        )
+            # One update per EPISODES_PER_UPDATE episodes. The GAE loop
+            # handles joined episodes because each ends with done=True.
+            if episode % EPISODES_PER_UPDATE == 0:
+                policy_loss, value_loss, policy_entropy = agent.update(memory)
+                memory = new_memory()
 
-        # Save model checkpoints periodically without printing table duplicates
-        if episode % checkpoint_every == 0:
-            save_path = os.path.join('src', 'checkpoints', f'ppo_checkpoint_{episode}.pth')
-            os.makedirs(os.path.dirname(save_path), exist_ok=True)
-            torch.save(agent.policy.state_dict(), save_path)
+            logger.log_cycle(
+                cycle=episode,
+                portfolio_values=portfolio_history,
+                daily_returns=daily_returns,
+                policy_loss=policy_loss,
+                value_loss=value_loss,
+                policy_entropy=policy_entropy,
+            )
 
-    # Stop live update engine and render session summary panel
-    logger.stop_dashboard()
+            if episode % checkpoint_every == 0:
+                os.makedirs(checkpoint_dir, exist_ok=True)
+                torch.save(agent.policy.state_dict(),
+                           os.path.join(checkpoint_dir, f'ppo_checkpoint_{episode}.pth'))
+    finally:
+        logger.stop_dashboard()
 
 
 if __name__ == "__main__":
-    run_ppo()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data", default=os.path.join("data", "processed", "train_data.csv"))
+    parser.add_argument("--episodes", type=int, default=500)
+    parser.add_argument("--ckpt-dir", default="checkpoints")
+    args = parser.parse_args()
+    run_ppo(num_episodes=args.episodes, data_path=args.data,
+            checkpoint_dir=args.ckpt_dir)

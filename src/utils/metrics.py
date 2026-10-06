@@ -54,14 +54,12 @@ def sortino_ratio(portfolio_values, periods_per_year=TRADING_DAYS_PER_YEAR, risk
     if len(returns) < 2:
         return 0.0
     excess = returns - (risk_free_rate / periods_per_year)
-    downside = excess[excess < 0]
-    if len(downside) == 0:
-        return 0.0
-    downside_std = np.std(downside, ddof=1) if len(downside) > 1 else np.abs(downside[0])
-    if downside_std < 1e-12:
-        return 0.0
-    return float(np.mean(excess) / downside_std * np.sqrt(periods_per_year))
-
+    downside_dev = np.sqrt(np.mean(np.minimum(excess, 0.0) ** 2))
+    if downside_dev < 1e-12:
+        if abs(np.mean(excess)) < 1e-12:
+            return 0.0              # flat: no return, no risk
+        return float("nan")         # profit with no losing day: undefined
+    return float(np.mean(excess) / downside_dev * np.sqrt(periods_per_year))
 
 def max_drawdown(portfolio_values):
     """
@@ -83,11 +81,13 @@ def calmar_ratio(portfolio_values, periods_per_year=TRADING_DAYS_PER_YEAR):
 
 
 def win_rate(portfolio_values):
-    """Fraction of steps with a positive return."""
+    """Fraction of ACTIVE steps (non-zero return) with a positive return.
+    Cash days are excluded, otherwise a mostly-cash strategy looks like it never wins."""
     returns = _returns_from_values(portfolio_values)
-    if len(returns) == 0:
+    active = returns[np.abs(returns) > 1e-12]
+    if len(active) == 0:
         return 0.0
-    return float(np.mean(returns > 0))
+    return float(np.mean(active > 0))
 
 def annualized_volatility(portfolio_values, periods_per_year=TRADING_DAYS_PER_YEAR):
     """Annualised standard deviation of per-step returns -- the actual

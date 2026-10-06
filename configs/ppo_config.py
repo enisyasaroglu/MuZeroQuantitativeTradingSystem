@@ -1,18 +1,27 @@
 from dataclasses import dataclass
 
-@dataclass
+
+@dataclass(frozen=True)
 class PPOConfig:
-    learning_rate: float = 3e-4      # Stable learning rate for time-series LSTM
-    gamma: float = 0.99              # Standard horizon
-    gae_lambda: float = 0.95         # Generalized Advantage Estimation lambda
-    
-    eps_clip: float = 0.2            # PPO clip ratio
-    k_epochs: int = 4                # Epochs per rollout batch
-    batch_size: int = 64             # Mini-batch size
-    
-    value_loss_coef: float = 0.1     # Scaled down to prevent critic overriding policy gradients
-    entropy_coef: float = 0.005      # Lower entropy coefficient to reduce action jitter/churn
-    max_grad_norm: float = 0.5       # Gradient clipping
-    target_kl: float = 0.015         # Target KL divergence limit for early stopping
+    # Optimisation
+    learning_rate: float = 3e-4
+    batch_size: int = 64
+    k_epochs: int = 4
+
+    # Discounting and advantage estimation
+    gamma: float = 0.99             # keep equal to MuZeroConfig.discount_factor
+    gae_lambda: float = 0.95
+
+    # Policy optimisation
+    eps_clip: float = 0.2
+    target_kl: float = 0.015
+
+    # Loss coefficients
+    value_loss_coef: float = 0.1
+    entropy_coef: float = 0.005
+
+    # Gradient clipping
+    max_grad_norm: float = 0.5
+
 
 ppo_config = PPOConfig()

@@ -71,9 +71,19 @@ class TimeSeriesEncoder(AbstractNetwork):
             )
 
     def forward(self, x):
-        # x shape: (Batch, Lookback, Features)
-        # RNN Output: (Batch, Lookback, Hidden_Size)
-        output, _ = self.rnn(x)
+        if x.ndim != 3:
+            raise ValueError(
+                "Expected input shape (batch, lookback, features)."
+            )
 
-        # Take the state at the LAST time step, bounded to [-1, 1].
+        if x.shape[1] == 0:
+            raise ValueError("Input sequence cannot be empty.")
+
+        if x.shape[2] != self.rnn.input_size:
+            raise ValueError(
+                f"Expected {self.rnn.input_size} features, "
+                f"received {x.shape[2]}."
+            )
+
+        output, _ = self.rnn(x)
         return torch.tanh(output[:, -1, :])

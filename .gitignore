@@ -14,7 +14,7 @@ data/processed/
 # clone size and every re-training run creates a new set. If you want a
 # specific checkpoint available to reviewers, upload it as a GitHub
 # Release asset instead, or use Git LFS.
-src/checkpoints/*.pth
+checkpoints/
 src/models/*.pth
 logs/checkpoints/
 logs/tensorboard/
@@ -30,3 +30,6 @@ logs/evaluation/*.json
 # Environments
 .env
 .venv
+
+# Other
+knowledge/

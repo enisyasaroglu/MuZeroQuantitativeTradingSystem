@@ -1,11 +1,13 @@
+import os
+import sys
+
 import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
-import sys
-import os
 
 # Add project root to path
-sys.path.append(os.path.join(os.path.dirname(__file__), '../../'))
+sys.path.append(os.path.join(os.path.dirname(__file__), "../../"))
+
 from configs.base_config import config
 from src.env.rewards import DifferentialSharpeRatio
 
@@ -15,176 +17,360 @@ class StockTradingEnv(gym.Env):
     A custom trading environment for S&P 500.
 
     Action Space:
-    0: Short (Sell)
-    1: Neutral (Hold Cash)
-    2: Long (Buy)
+        0: Short
+        1: Neutral (Cash)
+        2: Long
 
-    Portfolio value compounds continuously via the exact log-return
-    formula: portfolio_value *= exp(net_return). This is financially exact
-    for log-returns, unlike the linear approximation
-    portfolio_value *= (1 + net_return), which introduces compounding
-    error over long episodes.
+    Portfolio value compounds using exact log returns:
+        portfolio_value *= exp(net_return)
 
-    Reward is either the Differential Sharpe Ratio (dense, risk-adjusted;
-    config.USE_DSR_REWARD = True) or the raw net log-return (used for
-    baseline/ablation comparisons and for evaluation, where we want the
-    portfolio's true realised return rather than a shaped training signal).
+    Reward:
+        Differential Sharpe Ratio (DSR) when enabled.
+        Raw net log-return otherwise.
+
+    Risk Management:
+        Maximum drawdown and daily loss thresholds.
+        Once either threshold is breached, the agent
+        remains in cash for the rest of the episode.
+
+    Training:
+        Random contiguous historical windows when
+        window_size is specified.
+
+    Evaluation:
+        Full chronological sequence when window_size=None.
     """
 
-    metadata = {'render_modes': ['human']}
+    metadata = {"render_modes": ["human"]}
 
-    def __init__(self, df, mode='train', use_dsr=None, window_size=None):
-        """
-        window_size: if set, reset() samples a random contiguous slice of
-        this many rows from self.df each episode, instead of always
-        walking the full sequence from self.lookback to the end. This
-        prevents an agent from memorising one fixed historical path
-        (confirmed directly: MuZero's training dashboard showed
-        near-identical portfolio values recurring across non-adjacent
-        episodes, consistent with the policy reproducing the same trade
-        sequence on the same dates every time) rather than learning
-        features that generalise across regimes.
+    def __init__(
+        self,
+        df,
+        mode="train",
+        use_dsr=None,
+        window_size=None,
+        max_drawdown=None,
+        max_daily_loss=None,
+    ):
+        super().__init__()
+        
+        max_drawdown = config.MAX_DRAWDOWN if max_drawdown is None else max_drawdown
+        max_daily_loss = config.MAX_DAILY_LOSS if max_daily_loss is None else max_daily_loss
 
-        window_size=None (default) preserves the ORIGINAL full-sequential
-        behaviour -- unchanged for evaluation/backtesting, where walking
-        the complete, real chronological sequence is the correct thing to
-        do, not an oversight to fix. Only pass window_size for TRAINING.
-        """
-        super(StockTradingEnv, self).__init__()
+        # Validate inputs
+        if df is None or df.empty:
+            raise ValueError("Input dataframe cannot be empty.")
+
+        if max_drawdown <= 0 or max_drawdown > 1:
+            raise ValueError(
+                "max_drawdown must be in (0, 1]."
+            )
+
+        if max_daily_loss <= 0 or max_daily_loss > 1:
+            raise ValueError(
+                "max_daily_loss must be in (0, 1]."
+            )
+
+        if window_size is not None and (
+            not isinstance(window_size, int)
+            or isinstance(window_size, bool)
+            or window_size <= 0
+        ):
+            raise ValueError(
+                "window_size must be a positive integer."
+            )
+
         self.df = df.reset_index(drop=True)
         self.mode = mode
         self.window_size = window_size
 
-        # Action Space: 0=Short, 1=Neutral, 2=Long
+        self.max_drawdown = float(max_drawdown)
+        self.max_daily_loss = float(max_daily_loss)
+
+        # Action space: Short, Neutral, Long
         self.action_space = spaces.Discrete(3)
 
-        # Observation feature set EXCLUDES raw 'log_return' -- that column
-        # must stay unnormalised for portfolio compounding (see step()
-        # below), while the observation needs every feature on a
-        # comparable, roughly mean-0/std-1 scale. 'log_return_norm'
-        # (added by DataProcessor.normalize()) is used in the observation
-        # instead. Mirrors the same fix in multi_asset_env.py's
-        # feature_cols.
-        self.feature_cols = [c for c in df.columns if c not in ['date', 'tic', 'log_return']]
+        # Exclude raw log_return from observations.
+        # Keep it unnormalised for portfolio compounding.
+        # Use normalised features when available.
+        self.feature_cols = [
+            col
+            for col in self.df.columns
+            if col not in ["date", "tic", "log_return"]
+        ]
+
+        if not self.feature_cols:
+            raise ValueError(
+                "No observation features found in dataframe."
+            )
+
+        if "log_return" not in self.df.columns:
+            raise ValueError(
+                "Dataframe must contain a 'log_return' column."
+            )
+
         self.n_features = len(self.feature_cols)
         self.lookback = config.LOOKBACK_WINDOW
 
+        if len(self.df) <= self.lookback:
+            raise ValueError(
+                "Dataset must contain more rows than "
+                "the lookback window."
+            )
+
+        if window_size is not None:
+            available_steps = len(self.df) - self.lookback
+
+            if window_size > available_steps:
+                raise ValueError(
+                    "Dataset does not contain enough trading "
+                    "steps for the requested window_size."
+                )
+
+        # Observation: historical features + current position
         self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf,
-            shape=(self.lookback, self.n_features+1),
-            dtype=np.float32
+            low=-np.inf,
+            high=np.inf,
+            shape=(self.lookback, self.n_features + 1),
+            dtype=np.float32,
         )
 
-        # use_dsr defaults to config.USE_DSR_REWARD but can be overridden
-        # per-instance (e.g. evaluation always uses raw log-return so that
-        # reported financial metrics reflect true portfolio performance,
-        # not the shaped training signal).
-        self.use_dsr = config.USE_DSR_REWARD if use_dsr is None else use_dsr
+        # Reward configuration
+        self.use_dsr = (
+            config.USE_DSR_REWARD
+            if use_dsr is None
+            else use_dsr
+        )
+
         self.dsr = DifferentialSharpeRatio(
             eta=config.DSR_ETA,
             warmup_steps=config.DSR_WARMUP_STEPS,
             clip=config.DSR_CLIP,
         )
 
-        # State (all real initialisation happens in reset(); these are
-        # placeholders so attributes exist before the first reset() call)
+        # Environment state
         self.current_step = 0
-        self.current_action = 1  # Start Neutral
+        self.current_action = 1
+
         self.portfolio_value = config.INITIAL_CAPITAL
-        self.portfolio_history = [config.INITIAL_CAPITAL]
+        self.portfolio_history = [self.portfolio_value]
+
+        self.peak_portfolio_value = self.portfolio_value
+        self.risk_halted = False
+
+        self._window_start = self.lookback
+        self._window_end = len(self.df)
 
     def reset(self, seed=None, options=None):
         """
-        Resets to the start of a fresh episode window.
+        Reset the environment.
 
-        With window_size set: samples a random contiguous slice
-        [start, start+window_size) from self.df, so each episode covers a
-        different historical period rather than always the same full
-        sequence -- see window_size's docstring in __init__.
+        If window_size is specified, sample a random
+        contiguous window for training.
 
-        Both current_step AND portfolio_value are reset explicitly --
-        an earlier version of this environment reset current_step but
-        not portfolio_value, which meant each new episode silently
-        inherited whatever capital the previous episode ended with. That
-        bug produced anomalous, non-independent validation results across
-        checkpoints.
+        Otherwise, use the complete chronological
+        sequence for evaluation.
         """
         super().reset(seed=seed)
 
         if self.window_size is not None:
             max_start = len(self.df) - self.window_size
-            if max_start <= self.lookback:
-                # Not enough data for a full window -- fall back to the
-                # full sequence rather than raising, matching the
-                # window_size=None behaviour.
-                self._window_start = self.lookback
-                self._window_end = len(self.df)
-            else:
-                self._window_start = self.np_random.integers(self.lookback, max_start + 1)
-                self._window_end = self._window_start + self.window_size
+
+            self._window_start = int(
+                self.np_random.integers(
+                    self.lookback,
+                    max_start + 1,
+                )
+            )
+
+            self._window_end = (
+                self._window_start + self.window_size
+            )
         else:
             self._window_start = self.lookback
             self._window_end = len(self.df)
 
+        # Reset episode state
         self.current_step = self._window_start
-        self.current_action = 1  # Neutral
+        self.current_action = 1
+
         self.portfolio_value = config.INITIAL_CAPITAL
-        self.portfolio_history = [config.INITIAL_CAPITAL]
+        self.portfolio_history = [self.portfolio_value]
+
+        self.peak_portfolio_value = self.portfolio_value
+        self.risk_halted = False
+
         self.dsr.reset()
 
         return self._get_observation(), {}
 
     def step(self, action):
         """
-        Executes one time step.
+        Execute one trading step.
+
+        The action determines exposure to the next
+        realised log return. Risk limits are checked
+        after the return has been realised.
         """
-        window_end = getattr(self, '_window_end', len(self.df))
-        terminated = self.current_step >= min(window_end, len(self.df)) - 1
-        if terminated:
-            return self._get_observation(), 0.0, True, False, {
-                'portfolio_value': self.portfolio_value,
-            }
+        if self.current_step >= self._window_end:
+            raise RuntimeError(
+                "Episode has terminated. Call reset() "
+                "before taking another step."
+            )
 
-        # log_return at current_step is ln(P_t / P_{t-1}), i.e. the return
-        # realised BY today. We decide the action at t and realise the
-        # position's P&L over that same return.
-        current_log_return = self.df.iloc[self.current_step]['log_return']
+        action = int(action)
 
-        # Map action 0,1,2 to position multiplier -1, 0, 1
-        position_multiplier = int(action) - 1
-        gross_return = current_log_return * position_multiplier
+        if not self.action_space.contains(action):
+            raise ValueError(f"Invalid action: {action}")
 
-        # Transaction cost applied only when position changes
-        cost = config.TRANSACTION_FEE if int(action) != int(self.current_action) else 0.0
+        # Once halted, remain in cash.
+        if self.risk_halted:
+            action = 1
+
+        # Realised log return for this trading step
+        current_log_return = float(
+            self.df.iloc[self.current_step]["log_return"]
+        )
+
+        if not np.isfinite(current_log_return):
+            raise ValueError(
+                f"Invalid log return at index "
+                f"{self.current_step}."
+            )
+
+        # Map actions to portfolio exposure:
+        # Short = -1, Neutral = 0, Long = +1
+        position_multiplier = action - 1
+
+        gross_return = (
+            current_log_return * position_multiplier
+        )
+
+        # Charge transaction costs whenever the
+        # position changes, including entering cash.
+        old_position = self.current_action - 1
+        cost = config.TRANSACTION_FEE * abs(position_multiplier - old_position)
+
         net_return = gross_return - cost
 
-        # Portfolio compounding: exact log-return compounding, cost already
-        # deducted from net_return before this multiplication.
+        # Compound using log returns.
         self.portfolio_value *= np.exp(net_return)
-        self.portfolio_history.append(self.portfolio_value)
 
-        # Reward: DSR (single call per step -- an earlier version of this
-        # environment called dsr.step() twice per step, which silently
-        # advanced the DSR's internal EMA statistics twice per environment
-        # step and corrupted the reward signal) or raw net log-return.
-        reward = self.dsr.step(net_return) if self.use_dsr else net_return
+        self.portfolio_history.append(
+            self.portfolio_value
+        )
 
-        self.current_action = int(action)
+        # Update running portfolio peak.
+        self.peak_portfolio_value = max(
+            self.peak_portfolio_value,
+            self.portfolio_value,
+        )
+
+        # Calculate drawdown from the running peak.
+        drawdown = (
+            1.0
+            - self.portfolio_value
+            / self.peak_portfolio_value
+        )
+
+        # Calculate realised daily loss.
+        daily_loss = max(
+            0.0,
+            1.0 - np.exp(net_return),
+        )
+
+        # Trigger risk protection after the realised
+        # return. It applies to subsequent steps.
+        triggered = (
+            drawdown >= self.max_drawdown
+            or daily_loss >= self.max_daily_loss
+        )
+
+        if triggered:
+            self.risk_halted = True
+
+        # Calculate reward.
+        reward = (
+            self.dsr.step(net_return)
+            if self.use_dsr
+            else net_return
+        )
+
+        # Update state.
+        self.current_action = action
         self.current_step += 1
 
-        return self._get_observation(), reward, terminated, False, {
-            'portfolio_value': self.portfolio_value,
-            'net_return': net_return,
+        # End the episode after the requested number
+        # of trading transitions.
+        terminated = (
+            self.current_step >= self._window_end
+        )
+
+        truncated = False
+
+        info = {
+            "portfolio_value": self.portfolio_value,
+            "net_return": net_return,
+            "gross_return": gross_return,
+            "transaction_cost": cost,
+            "drawdown": drawdown,
+            "daily_loss": daily_loss,
+            "risk_halted": self.risk_halted,
+            "position": position_multiplier,
         }
+
+        return (
+            self._get_observation(),
+            reward,
+            terminated,
+            truncated,
+            info,
+        )
 
     def _get_observation(self):
         """
-        Returns the window of features ending at current_step.
+        Return the historical observation window.
+
+        Only data up to, but not including, current_step
+        is included. The current portfolio position is
+        appended as an additional feature.
         """
-        window = self.df.iloc[self.current_step - self.lookback: self.current_step][self.feature_cols]
-        position = np.full((self.lookback, 1), self.current_action - 1, dtype=np.float32)
-        return np.concatenate([window.values.astype(np.float32), position], axis=1)
+        window = self.df.iloc[
+            self.current_step - self.lookback:
+            self.current_step
+        ][self.feature_cols]
+
+        features = window.to_numpy(dtype=np.float32)
+
+        position = np.full(
+            (self.lookback, 1),
+            self.current_action - 1,
+            dtype=np.float32,
+        )
+
+        observation = np.concatenate(
+            [features, position],
+            axis=1,
+        )
+
+        return observation.astype(np.float32)
 
     def render(self):
-        print(f"Step: {self.current_step}, Position: {self.current_action}, "
-              f"Portfolio Value: {self.portfolio_value:.2f}")
+        """Display the current environment state."""
+        position_names = {
+            -1: "Short",
+            0: "Neutral",
+            1: "Long",
+        }
+
+        position = self.current_action - 1
+        position_name = position_names[position]
+
+        print(
+            f"Step: {self.current_step} | "
+            f"Position: {position_name} | "
+            f"Portfolio: {self.portfolio_value:.2f} | "
+            f"Drawdown: "
+            f"{1 - self.portfolio_value / self.peak_portfolio_value:.2%} | "
+            f"Risk Halted: {self.risk_halted}"
+        )

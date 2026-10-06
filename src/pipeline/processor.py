@@ -30,6 +30,13 @@ class DataProcessor:
     this way -- the ordering is what prevents look-ahead bias.
     """
 
+    # Indicators that stockstats measures in PRICE units. As the index
+    # rises (e.g. ~2,000 -> ~4,800) their raw values drift upward, so
+    # z-scoring them with train-only statistics pushes later splits many
+    # standard deviations outside the training range. Dividing by the
+    # closing price makes them scale-free.
+    PRICE_SCALED = ("macd", "atr_30", "boll_ub", "boll_lb")
+
     def __init__(self):
         self.tech_indicators = config.TECH_INDICATORS
 
@@ -63,16 +70,27 @@ class DataProcessor:
         return train_df.reset_index(drop=True), val_df.reset_index(drop=True), test_df.reset_index(drop=True)
 
     def add_technical_indicators(self, df):
+        """Adds the configured stockstats indicators.
+
+        No try/except around the indicator lookup on purpose: a typo in
+        config.TECH_INDICATORS must raise, not silently shrink the
+        observation vector.
+
+        Price-unit indicators (see PRICE_SCALED) are divided by `close`,
+        so `close` must still be present in df when this runs. It is
+        dropped later, in normalize() via _drop_raw_ohlc().
+        """
         if df.empty:
             return df
         df = df.copy()
         stock = Sdf.retype(df.copy())
 
         for indicator in self.tech_indicators:
-            try:
-                df[indicator] = stock[indicator].values
-            except Exception:
-                pass
+            df[indicator] = stock[indicator].values
+
+        for col in self.PRICE_SCALED:
+            if col in df.columns:
+                df[col] = df[col] / df['close']
 
         return df.dropna().reset_index(drop=True)
 
@@ -113,23 +131,6 @@ class DataProcessor:
 
         return self._drop_raw_ohlc(train_df), self._drop_raw_ohlc(val_df), self._drop_raw_ohlc(test_df)
 
-
-    def add_regime_features(train_df: pd.DataFrame, test_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-        detector = RegimeDetector(n_states=3, window=20)
-        
-        # Fit on train log-returns, predict on train and test
-        train_regimes, test_regimes = detector.fit_predict_pipeline(
-            train_df["log_return"], 
-            test_df["log_return"]
-        )
-        
-        # Merge one-hot features back into dataframes
-        train_out = train_df.join(train_regimes[["regime_bear", "regime_sideways", "regime_bull"]])
-        test_out = test_df.join(test_regimes[["regime_bear", "regime_sideways", "regime_bull"]])
-        
-        # Forward-fill initial warmup NaN values from rolling window
-        return train_out.bfill(), test_out.bfill()
-        
     @staticmethod
     def _drop_raw_ohlc(df):
         """Drops raw price-scale columns before the frame reaches
@@ -152,7 +153,7 @@ class DataProcessor:
             test_feat = self.add_technical_indicators(test_raw)
 
             return self.normalize(train_feat, val_feat, test_feat)
-    
+
     def process_multi_asset(self, raw_df):
         """
         Multi-asset pipeline. Structurally reuses process()'s per-asset

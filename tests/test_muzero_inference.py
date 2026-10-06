@@ -5,11 +5,14 @@ import numpy as np
 sys.path.append(os.path.join(os.path.dirname(__file__), '../'))
 from configs.muzero_config import MuZeroConfig
 from src.agents.muzero.muzero_agent import MuZeroAgent
+from configs.base_config import ProjectConfig
 
 def test_inference():
     # 1. Setup
     config = MuZeroConfig()
-    obs_shape = (config.window_size, 11) # (60, 11)
+    project_config = ProjectConfig()
+    
+    obs_shape = (project_config.LOOKBACK_WINDOW, 11) # (60, 11)
     
     print("Initializing MuZero Agent...")
     agent = MuZeroAgent(config, obs_shape)

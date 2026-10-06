@@ -158,12 +158,3 @@ Full bibliography in the accompanying dissertation.
 ## License
 
 MIT# MuZeroQuantitativeTradingSystem
-
-
-pip3 install -r requirements.txt
-python3 src/pipeline/data_fetcher.py --multi-asset
-python3 src/pipeline/processor.py
-python3 main_ppo.py
-python3 main_muzero.py
-python3 evaluate.py --agent all --split test
-pytest tests/

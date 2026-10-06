@@ -34,8 +34,19 @@ class MultiAssetTradingEnv(gym.Env):
 
     def __init__(self, df, use_dsr=None, optimizer: PortfolioOptimizerProtocol = None,
                  constraints: PortfolioConstraints = None,
-                 rebalance_every: int = 20, lookback_window: int = 60):
+                 rebalance_every: int = 20, lookback_window: int = 60,
+                 window_size: int = None):
+        """
+        window_size: if set, reset() samples a random contiguous slice of
+        this many rows per episode instead of always walking the full
+        sequence -- same purpose and mechanism as StockTradingEnv's
+        window_size (prevents memorising one fixed historical path).
+        None (default) preserves full-sequential behaviour -- required
+        for evaluation, unchanged for any existing caller that doesn't
+        pass this argument.
+        """
         super().__init__()
+        self.window_size = window_size
         self.tickers = sorted(df['tic'].unique())
         self.n_assets = len(self.tickers)
         self.lookback = config.LOOKBACK_WINDOW
@@ -107,7 +118,20 @@ class MultiAssetTradingEnv(gym.Env):
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-        self.current_step = self.lookback
+
+        if self.window_size is not None:
+            max_start = self.n_dates - self.window_size
+            if max_start <= self.lookback:
+                self._window_start = self.lookback
+                self._window_end = self.n_dates
+            else:
+                self._window_start = self.np_random.integers(self.lookback, max_start + 1)
+                self._window_end = self._window_start + self.window_size
+        else:
+            self._window_start = self.lookback
+            self._window_end = self.n_dates
+
+        self.current_step = self._window_start
         self.current_weights = np.zeros(self.n_assets)
         self.portfolio_value = config.INITIAL_CAPITAL
         self.portfolio_history = [config.INITIAL_CAPITAL]
@@ -116,7 +140,8 @@ class MultiAssetTradingEnv(gym.Env):
         return self._get_observation(), {}
 
     def step(self, action):
-        terminated = self.current_step >= self.n_dates - 1
+        window_end = getattr(self, '_window_end', self.n_dates)
+        terminated = self.current_step >= window_end - 1
         if terminated:
             return self._get_observation(), 0.0, True, False, {'portfolio_value': self.portfolio_value}
 
