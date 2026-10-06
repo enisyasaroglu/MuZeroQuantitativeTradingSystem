@@ -128,12 +128,6 @@ class MuZeroAgent:
                 for a in range(self.action_dim)
             ]
 
-            print(
-                f"MCTS visits: Short={visit_counts[0]}, "
-                f"Neutral={visit_counts[1]}, "
-                f"Long={visit_counts[2]}"
-            )
-
             sum_visits = sum(visit_counts)
             
             if sum_visits == 0:

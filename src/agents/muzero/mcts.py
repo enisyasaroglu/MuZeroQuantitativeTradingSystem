@@ -54,13 +54,6 @@ def run_mcts(config, root_state, network, min_max_stats, add_exploration_noise=T
     
     # Softmax to get probabilities
     policy = torch.softmax(policy_logits, dim=1).squeeze(0).cpu().numpy()
-
-    print(
-        f"Root policy: Short={policy[0]:.3f}, "
-        f"Neutral={policy[1]:.3f}, "
-        f"Long={policy[2]:.3f} | "
-        f"Value={value.item():.4f}"
-    )
     
     # --- Add Dirichlet Noise (Training only) ---
     if add_exploration_noise:
@@ -106,13 +99,6 @@ def run_mcts(config, root_state, network, min_max_stats, add_exploration_noise=T
         # Create children for this new node
         node.is_expanded = True
         policy = torch.softmax(policy_logits, dim=1).squeeze(0).cpu().numpy()
-        
-        print(
-            f"Root policy: Short={policy[0]:.3f}, "
-            f"Neutral={policy[1]:.3f}, "
-            f"Long={policy[2]:.3f} | "
-            f"Value={value.item():.4f}"
-        )
         
         for i in range(config.action_space_dim):
             node.children[i] = Node(policy[i])
