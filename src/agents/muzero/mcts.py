@@ -43,25 +43,30 @@ class Node:
 def run_mcts(config, root_state, network, min_max_stats, add_exploration_noise=True):
     """
     The core Open Loop MCTS loop.
-
-    add_exploration_noise: True during training self-play, False during
-    evaluation. Root Dirichlet noise is a TRAINING-ONLY exploration
-    mechanism -- without this flag, 25% of every root prior is random
-    noise even for a fully-trained network being evaluated, which was
-    confirmed directly: deterministic evaluation runs showed MuZero
-    behaving identically noisy regardless of checkpoint quality until
-    this was fixed.
     """
     root = Node(0)
     root.hidden_state = root_state
     root.is_expanded = True
-
+    
     # --- 1. Expand Root ---
+    # Get Policy and Value for the current real observation
     policy_logits, value = network.prediction(root_state)
+    
+    # Softmax to get probabilities
     policy = torch.softmax(policy_logits, dim=1).squeeze(0).cpu().numpy()
 
+    print(
+        f"Root policy: Short={policy[0]:.3f}, "
+        f"Neutral={policy[1]:.3f}, "
+        f"Long={policy[2]:.3f} | "
+        f"Value={value.item():.4f}"
+    )
+    
+    # --- Add Dirichlet Noise (Training only) ---
     if add_exploration_noise:
-        noise = np.random.dirichlet([config.root_dirichlet_alpha] * config.action_space_dim)
+        noise = np.random.dirichlet(
+            [config.root_dirichlet_alpha] * config.action_space_dim
+        )
         frac = config.root_exploration_fraction
     else:
         noise = np.zeros(config.action_space_dim)
@@ -101,6 +106,14 @@ def run_mcts(config, root_state, network, min_max_stats, add_exploration_noise=T
         # Create children for this new node
         node.is_expanded = True
         policy = torch.softmax(policy_logits, dim=1).squeeze(0).cpu().numpy()
+        
+        print(
+            f"Root policy: Short={policy[0]:.3f}, "
+            f"Neutral={policy[1]:.3f}, "
+            f"Long={policy[2]:.3f} | "
+            f"Value={value.item():.4f}"
+        )
+        
         for i in range(config.action_space_dim):
             node.children[i] = Node(policy[i])
             
@@ -125,17 +138,17 @@ def select_child(config, node, min_max_stats):
     return best_action, best_child
 
 def ucb_score(config, parent, child, min_max_stats):
-    """The AlphaZero UCB Formula."""
     pb_c = math.log((parent.visit_count + config.pb_c_base + 1) / config.pb_c_base) + config.pb_c_init
     pb_c *= math.sqrt(parent.visit_count) / (child.visit_count + 1)
 
     prior_score = pb_c * child.prior
+
     if child.visit_count > 0:
-        q = child.reward + config.discount_factor * child.value()
-        value_score = min_max_stats.normalize(q)
+        q_value = child.reward + config.discount_factor * child.value()
+        value_score = min_max_stats.normalize(q_value)
     else:
         value_score = 0.0
-    
+
     return prior_score + value_score
 
 def backpropagate(search_path, value, discount, min_max_stats):
