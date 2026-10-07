@@ -1,1030 +1,428 @@
 """
-Evaluation script: runs one or more agents on a held-out data split and
-reports the standardised financial metric set.
+Evaluation script: plays one or more agents over a held-out split in the
+trading environment and reports the standard financial metrics.
 
-Supported agents:
-    - muzero
-    - ppo
-    - sma
-    - buy_and_hold
-    - all
+Examples
+--------
+    # Baselines only
+    python3 evaluate.py --agent all --split val
 
-SMA baseline:
-    - 50-period simple moving average
-    - Long when price > SMA
-    - Neutral when price <= SMA
-    - Never shorts
+    # A MuZero checkpoint plus the baselines
+    python3 evaluate.py --agent all --split val \
+        --muzero-ckpt runs/run_001/muzero_checkpoint_500.pth
 
-Evaluation intentionally uses RAW net log-return as the environment reward
-(use_dsr=False), not the shaped DSR training signal.
+    # PPO only
+    python3 evaluate.py --agent ppo --split val --ppo-ckpt runs/ppo_001/ppo_final.pth
 
-Evaluation is deterministic:
-    - MuZero: temperature=0.0, no exploration noise
-    - PPO: deterministic=True
-
-Risk overlay:
-    --max-drawdown enables the optional RiskManager kill-switch on
-    MuZero and PPO only.
-
-Buy-and-Hold and SMA remain pure benchmark strategies.
+Rules this script follows
+-------------------------
+* Checkpoints are never guessed: pass --muzero-ckpt / --ppo-ckpt explicitly.
+* MuZero is evaluated with the config saved next to its checkpoint.
+* Evaluation uses raw net log-returns (no DSR), deterministic actions
+  (MuZero temperature 0, no noise; PPO argmax).
+* The default split is 'val'. Every run is appended to
+  logs/evaluation/evaluation_log.csv, so test-set use is always on record.
 """
 
 import argparse
-import glob
+import hashlib
+import json
 import os
+import random
+from dataclasses import asdict, dataclass, fields
+from datetime import datetime
 
 import matplotlib
-matplotlib.use("Agg")
 
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
 
+from configs.base_config import config
 from configs.muzero_config import MuZeroConfig
-from src.env.trading_env import StockTradingEnv
-from src.agents.muzero.muzero_agent import MuZeroAgent, load_muzero_checkpoint
+from src.agents.muzero.muzero_agent import MuZeroAgent
 from src.agents.ppo.ppo_agent import PPOAgent
-from src.utils.dashboard_logger import QuantRLLogger
-from src.utils.metrics import (
-    compute_all_metrics,
-    annualized_volatility,
-    worst_single_period_loss,
-)
+from src.env.trading_env import StockTradingEnv
 from src.risk.risk_manager import RiskManager
-from src.strategies import BuyAndHoldStrategy, SMAStrategy
+from src.utils.dashboard_logger import QuantRLLogger
+from src.utils.metrics import compute_all_metrics
 
-
-ACTION_NAMES = {
-    0: "Short",
-    1: "Neutral",
-    2: "Long",
-}
-
-POSITION_EXPOSURE_PCT = {
-    0: -100.0,
-    1: 0.0,
-    2: 100.0,
-}
-
+ACTION_NAMES = {0: "Short", 1: "Neutral", 2: "Long"}
+EXPOSURE_PCT = {0: -100.0, 1: 0.0, 2: 100.0}
+DEFAULT_OUT_DIR = os.path.join("logs", "evaluation")
 SMA_WINDOW = 50
+BASELINES = ["buy_and_hold", "cash", "sma"]
 
 
-def load_split(split: str) -> pd.DataFrame:
-    path = os.path.join(
-        "data",
-        "processed",
-        f"{split}_data.csv",
-    )
+# Small helpers
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
 
+
+def file_sha256(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def slug(name: str) -> str:
+    return "".join(c if c.isalnum() else "_" for c in name.lower()).strip("_")
+
+
+def json_safe(value):
+    """Make nested values JSON-friendly (NaN/inf become null)."""
+    if isinstance(value, dict):
+        return {k: json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(v) for v in value]
+    if isinstance(value, (np.floating, float)):
+        value = float(value)
+        return value if np.isfinite(value) else None
+    if isinstance(value, np.integer):
+        return int(value)
+    return value
+
+
+def load_split(split: str):
+    path = os.path.join("data", "processed", f"{split}_data.csv")
     if not os.path.exists(path):
         raise FileNotFoundError(
-            f"{path} not found. Run "
-            "`python src/pipeline/processor.py` first "
-            "to generate train/val/test_data.csv."
+            f"{path} not found. Run `python3 src/pipeline/processor.py` first."
         )
-
-    return pd.read_csv(path)
-
-
-def find_latest_checkpoint(prefix: str):
-    """
-    Find the checkpoint with the highest episode number matching:
-
-        checkpoints/{prefix}_*.pth
-    """
-
-    files = glob.glob(
-        os.path.join(
-            "checkpoints",
-            f"{prefix}_*.pth",
-        )
-    )
-
-    if not files:
-        return None
-
-    def extract_ep(filepath):
-        try:
-            return int(
-                filepath.split("_")[-1].replace(".pth", "")
-            )
-        except ValueError:
-            return -1
-
-    return max(files, key=extract_ep)
+    return pd.read_csv(path), path
 
 
-def run_episode(
-    env: StockTradingEnv,
-    action_fn,
-    risk_manager: RiskManager = None,
-):
-    """
-    Run one complete pass over the split.
+# Playing a split
+@dataclass
+class EpisodeResult:
+    portfolio_history: list
+    positions: list
+    step_indices: list
+    risk_overrides: int
 
-    action_fn(obs) -> int action
 
-    Returns:
-        portfolio_history
-        action_counts
-        position_history
-        step_indices
-        risk_overrides
-    """
-
+def play_split(env, action_fn, risk_manager=None) -> EpisodeResult:
+    """Run one full chronological pass. action_fn(obs) -> action in {0,1,2}."""
     obs, _ = env.reset()
-
-    done = False
-
-    action_counts = {
-        0: 0,
-        1: 0,
-        2: 0,
-    }
-
-    position_history = []
-    step_indices = []
-
     if risk_manager is not None:
-        risk_manager.reset(
-            initial_value=env.portfolio_value
-        )
+        risk_manager.reset(initial_value=env.portfolio_value)
 
+    positions, step_indices = [], []
+    done = False
     while not done:
-
-        step_indices.append(
-            env.current_step
-        )
-
-        proposed_action = action_fn(obs)
-
+        step_indices.append(env.current_step)
+        action = int(action_fn(obs))
         if risk_manager is not None:
-            action = risk_manager.filter_action(
-                proposed_action,
-                env.portfolio_value,
-            )
-        else:
-            action = proposed_action
-
-        action_counts[int(action)] += 1
-        position_history.append(int(action))
-
-        obs, reward, terminated, truncated, info = env.step(
-            action
-        )
-
+            action = int(risk_manager.filter_action(action, env.portfolio_value))
+        positions.append(action)
+        obs, _, terminated, truncated, _ = env.step(action)
         done = terminated or truncated
 
-    risk_overrides = (
-        risk_manager.triggered_count
-        if risk_manager is not None
-        else 0
-    )
-
-    return (
-        env.portfolio_history,
-        action_counts,
-        position_history,
-        step_indices,
-        risk_overrides,
-    )
+    overrides = risk_manager.triggered_count if risk_manager is not None else 0
+    return EpisodeResult(list(env.portfolio_history), positions, step_indices, overrides)
 
 
-def evaluate_muzero(
-    df,
-    checkpoint_path,
-    risk_manager: RiskManager = None,
-):
-    if not checkpoint_path or not os.path.exists(checkpoint_path):
-        raise FileNotFoundError(
-            f"No MuZero checkpoint found ({checkpoint_path}). "
-            "Aborting rather than evaluating an untrained network. "
-            "Train one first with `python main_muzero.py`."
+# Agents: each builder returns (display_name, action_fn, metadata)
+def check_input_width(state_dict, key, env, label):
+    """Fail early, readably, if the checkpoint was trained on other features."""
+    expected = state_dict[key].shape[1]
+    actual = env.observation_space.shape[1]
+    if expected != actual:
+        raise ValueError(
+            f"{label} checkpoint expects {expected} input columns but the data "
+            f"gives {actual}. Features now: {env.feature_cols} (plus position). "
+            "Regenerate the data or use a matching checkpoint."
         )
 
-    env = StockTradingEnv(
-        df,
-        use_dsr=False,
-    )
 
-    cfg = MuZeroConfig()
+def load_muzero_config(ckpt: str) -> MuZeroConfig:
+    """Use the config saved next to the checkpoint, so evaluation runs with
+    the settings (search simulations, discount, ...) the model trained with."""
+    cfg_path = ckpt.replace(".pth", "_config.json")
+    if not os.path.exists(cfg_path):
+        print(f"  WARNING: no saved config next to {ckpt}; using current defaults.")
+        return MuZeroConfig()
+    with open(cfg_path, "r", encoding="utf-8") as handle:
+        saved = json.load(handle)
+    known = {fld.name for fld in fields(MuZeroConfig)}
+    kwargs = {k: v for k, v in saved.items() if k in known}
+    missing = sorted(known - set(kwargs))
+    if missing:
+        print(f"  WARNING: saved config lacks {missing}; defaults used for these.")
+    return MuZeroConfig(**kwargs)
 
-    agent = MuZeroAgent(
-        cfg,
-        env.observation_space.shape,
-    )
 
-    load_muzero_checkpoint(
-        agent,
-        checkpoint_path,
-    )
+def build_muzero(env, ckpt):
+    state_dict = torch.load(ckpt, map_location="cpu", weights_only=True)
+    check_input_width(state_dict, "representation.encoder.rnn.weight_ih_l0", env, "MuZero")
+    cfg = load_muzero_config(ckpt)
 
-    print(
-        f"Loaded MuZero checkpoint: {checkpoint_path}"
-    )
+    agent = MuZeroAgent(cfg, env.observation_space.shape)
+    agent.network.load_state_dict(state_dict)
+    agent.network.eval()
+    print(f"  Loaded {ckpt} ({cfg.num_simulations} simulations per decision)")
 
     def action_fn(obs):
         action, _, _ = agent.select_action(
-            obs,
-            temperature=0.0,
-            add_exploration_noise=False,
+            obs, temperature=0.0, add_exploration_noise=False
         )
         return action
 
-    return run_episode(
-        env,
-        action_fn,
-        risk_manager=risk_manager,
-    )
+    meta = {"checkpoint": ckpt, "checkpoint_sha256": file_sha256(ckpt), "config": asdict(cfg)}
+    return "MuZero", action_fn, meta
 
 
-def evaluate_ppo(
-    df,
-    checkpoint_path,
-    risk_manager: RiskManager = None,
-):
-    if not checkpoint_path or not os.path.exists(checkpoint_path):
-        raise FileNotFoundError(
-            f"No PPO checkpoint found ({checkpoint_path}). "
-            "Aborting rather than evaluating an untrained network. "
-            "Train one first with `python main_ppo.py`."
-        )
+def build_ppo(env, ckpt):
+    state_dict = torch.load(ckpt, map_location="cpu", weights_only=True)
+    check_input_width(state_dict, "encoder.rnn.weight_ih_l0", env, "PPO")
 
-    env = StockTradingEnv(
-        df,
-        use_dsr=False,
-    )
-
-    agent = PPOAgent(
-        obs_shape=env.observation_space.shape,
-        action_dim=env.action_space.n,
-    )
-
-    agent.policy.load_state_dict(
-        torch.load(
-            checkpoint_path,
-            map_location=agent.device,
-        )
-    )
-
+    agent = PPOAgent(obs_shape=env.observation_space.shape, action_dim=env.action_space.n)
+    agent.policy.load_state_dict(state_dict)
     agent.policy.eval()
-
-    print(
-        f"Loaded PPO checkpoint: {checkpoint_path}"
-    )
+    print(f"  Loaded {ckpt}")
 
     def action_fn(obs):
-        action, _, _ = agent.select_action(
-            obs,
-            deterministic=True,
-        )
+        action, _, _ = agent.select_action(obs, deterministic=True)
         return action
 
-    return run_episode(
-        env,
-        action_fn,
-        risk_manager=risk_manager,
-    )
+    meta = {"checkpoint": ckpt, "checkpoint_sha256": file_sha256(ckpt)}
+    return "PPO", action_fn, meta
 
 
-def evaluate_buy_and_hold(df):
+def build_buy_and_hold():
+    return "Buy-and-Hold", (lambda obs: 2), {}
+
+
+def build_cash():
+    return "Cash", (lambda obs: 1), {}
+
+
+def build_sma(env, df, window):
+    """Long when yesterday's close was above its moving average, else cash.
+
+    Timing: at row t the agent has seen closes up to row t-1 and earns the
+    return of row t. So the signal for row t is (price > SMA) evaluated at
+    row t-1. A relative price path is rebuilt from the raw log returns; its
+    arbitrary starting level does not affect the signal.
     """
-    Pure Buy-and-Hold benchmark.
-
-    Always maintains a Long position.
-
-    No risk overlay is applied.
-    """
-
-    env = StockTradingEnv(
-        df,
-        use_dsr=False,
-    )
-
-    return run_episode(
-        env,
-        action_fn=lambda obs: 2,
-    )
-
-
-def reconstruct_price_from_log_returns(df):
-    """
-    Reconstruct a relative price index from log returns.
-
-    The processed dataset intentionally removes raw OHLC prices,
-    but retains raw `log_return`.
-
-    Given:
-
-        log_return_t = log(P_t / P_{t-1})
-
-    cumulative exponentiation reconstructs the price path
-    up to an arbitrary constant.
-
-    The arbitrary starting price does not affect SMA signals.
-    """
-
-    if "log_return" not in df.columns:
-        raise ValueError(
-            "SMA evaluation requires the processed dataframe "
-            "to contain the raw 'log_return' column."
-        )
-
-    log_returns = pd.to_numeric(
-        df["log_return"],
-        errors="coerce",
-    )
-
-    if log_returns.isna().any():
-        raise ValueError(
-            "SMA evaluation found NaN values in 'log_return'. "
-            "Clean the processed test data before evaluation."
-        )
-
-    relative_price = np.exp(
-        log_returns.cumsum()
-    )
-
-    return pd.Series(
-        relative_price,
-        index=df.index,
-        name="close",
-    )
-
-
-def evaluate_sma(df, window=SMA_WINDOW):
-    """
-    Evaluate a Simple Moving Average baseline.
-
-    Strategy:
-        price > SMA(window) -> Long
-        price <= SMA(window) -> Neutral
-
-    No shorting.
-
-    The processed dataset does not contain raw close prices,
-    so a relative price series is reconstructed from raw log returns.
-    """
-
     if window <= 0:
-        raise ValueError(
-            "SMA window must be greater than zero."
-        )
+        raise ValueError("SMA window must be greater than zero.")
+    log_returns = pd.to_numeric(df["log_return"], errors="coerce")
+    if log_returns.isna().any():
+        raise ValueError("SMA baseline found NaN values in 'log_return'.")
 
-    # Reconstruct relative price from raw log returns.
-    sma_df = df.copy()
-
-    sma_df["close"] = reconstruct_price_from_log_returns(
-        sma_df
-    )
-
-    strategy = SMAStrategy(
-        window=window
-    )
-
-    signals = strategy.generate_signals(
-        sma_df
-    )
-
-    env = StockTradingEnv(
-        df,
-        use_dsr=False,
-    )
+    price = np.exp(log_returns.cumsum())
+    above = (price > price.rolling(window).mean()).shift(1, fill_value=False)
+    long_signal = above.to_numpy()
 
     def action_fn(obs):
-        current_step = env.current_step
+        return 2 if long_signal[env.current_step] else 1
 
-        signal = int(
-            signals.iloc[current_step]["signal"]
-        )
+    return f"SMA({window})", action_fn, {"window": window}
 
-        # SMAStrategy:
-        #   0 = Neutral
-        #   1 = Long
-        #
-        # Environment:
-        #   0 = Short
-        #   1 = Neutral
-        #   2 = Long
 
-        if signal == 1:
-            return 2
+def build_agent(key, env, df, args):
+    if key == "muzero":
+        return build_muzero(env, args.muzero_ckpt)
+    if key == "ppo":
+        return build_ppo(env, args.ppo_ckpt)
+    if key == "buy_and_hold":
+        return build_buy_and_hold()
+    if key == "cash":
+        return build_cash()
+    if key == "sma":
+        return build_sma(env, df, args.sma_window)
+    raise ValueError(f"Unknown agent: {key}")
 
-        return 1
 
-    print(
-        f"SMA strategy: {window}-period SMA"
+# Reporting and exports
+def report(name, result):
+    metrics = compute_all_metrics(result.portfolio_history)
+    counts = np.bincount(result.positions, minlength=3)
+    dist = {ACTION_NAMES[a]: 100.0 * counts[a] / counts.sum() for a in ACTION_NAMES}
+
+    QuantRLLogger(agent_name=name, asset_symbol="").print_evaluation_report(
+        name, metrics, dist, result.portfolio_history[-1]
     )
-
-    return run_episode(
-        env,
-        action_fn,
-    )
-
-
-def action_distribution_pct(action_counts):
-    total = sum(
-        action_counts.values()
-    )
-
-    if total == 0:
-        return {
-            ACTION_NAMES[a]: 0.0
-            for a in ACTION_NAMES
-        }
-
-    return {
-        ACTION_NAMES[a]: 100.0 * count / total
-        for a, count in action_counts.items()
-    }
+    print(f"  Annualised Volatility : {metrics['annualized_volatility']:.2%}")
+    print(f"  Worst Single-Step Loss: {metrics['worst_single_period_loss']:.2%}")
+    if result.risk_overrides:
+        print(f"  Risk Overrides        : {result.risk_overrides} steps forced flat")
+    return metrics, dist
 
 
-def export_equity_and_positions(
-    name,
-    df,
-    portfolio_history,
-    position_history,
-    step_indices,
-    split,
-    out_dir="logs/evaluation",
-):
-    """
-    Save complete per-step portfolio and position history.
-    """
-
-    os.makedirs(
-        out_dir,
-        exist_ok=True,
-    )
-
-    n = min(
-        len(step_indices),
-        len(position_history),
-        len(portfolio_history) - 1,
-    )
-
-    dates = (
-        df["date"]
-        .iloc[step_indices[:n]]
-        .reset_index(drop=True)
-    )
-
-    trimmed_positions = position_history[:n]
-
-    out_df = pd.DataFrame(
+def build_equity_frame(df, result):
+    n = len(result.positions)
+    return pd.DataFrame(
         {
-            "date": dates,
-            "portfolio_value": portfolio_history[
-                1:1 + n
-            ],
-            "position_action": trimmed_positions,
-            "position_label": [
-                ACTION_NAMES[a]
-                for a in trimmed_positions
-            ],
-            "exposure_pct": [
-                POSITION_EXPOSURE_PCT[a]
-                for a in trimmed_positions
-            ],
+            "date": df["date"].iloc[result.step_indices].reset_index(drop=True),
+            "portfolio_value": result.portfolio_history[1 : 1 + n],
+            "position_action": result.positions,
+            "position_label": [ACTION_NAMES[a] for a in result.positions],
+            "exposure_pct": [EXPOSURE_PCT[a] for a in result.positions],
         }
     )
 
-    filename = (
-        f"{split}_"
-        f"{name.lower().replace(' ', '_')}"
-        f"_equity.csv"
-    )
 
-    out_path = os.path.join(
-        out_dir,
-        filename,
-    )
-
-    out_df.to_csv(
-        out_path,
-        index=False,
-    )
-
-    print(
-        f"  Saved full equity/position history: "
-        f"{out_path}"
-    )
-
-    return out_df
-
-
-def plot_equity_comparison(
-    equity_dfs: dict,
-    split,
-    out_dir="logs/evaluation",
-):
-    """
-    Plot all evaluated equity curves together.
-    """
-
-    plt.figure(
-        figsize=(11, 5)
-    )
-
-    for name, edf in equity_dfs.items():
-
-        plt.plot(
-            pd.to_datetime(edf["date"]),
-            edf["portfolio_value"],
-            label=name,
-            linewidth=1.6,
-        )
-
-    plt.title(
-        f"Equity Curve Comparison ({split} split)"
-    )
-
-    plt.xlabel("Date")
-    plt.ylabel("Portfolio Value")
-
-    plt.legend()
-
-    plt.grid(
-        True,
-        linestyle="--",
-        alpha=0.4,
-    )
-
-    plt.tight_layout()
-
-    os.makedirs(
-        out_dir,
-        exist_ok=True,
-    )
-
-    out_path = os.path.join(
-        out_dir,
-        f"{split}_equity_comparison.png",
-    )
-
-    plt.savefig(
-        out_path,
-        dpi=150,
-    )
-
-    plt.close()
-
-    print(
-        f"  Saved equity curve comparison: "
-        f"{out_path}"
-    )
-
-
-def plot_exposure_over_time(
-    name,
-    equity_df,
-    split,
-    out_dir="logs/evaluation",
-):
-    """
-    Plot position/exposure over time for one strategy.
-    """
-
-    plt.figure(
-        figsize=(11, 2.5)
-    )
-
-    plt.step(
-        pd.to_datetime(equity_df["date"]),
-        equity_df["exposure_pct"],
-        where="post",
-        linewidth=1.2,
-    )
-
-    plt.title(
-        f"{name} — Exposure Over Time ({split} split)"
-    )
-
+def plot_exposure(name, frame, split, out_dir):
+    plt.figure(figsize=(11, 2.5))
+    plt.step(pd.to_datetime(frame["date"]), frame["exposure_pct"], where="post", linewidth=1.2)
+    plt.title(f"{name} - Exposure Over Time ({split} split)")
     plt.xlabel("Date")
     plt.ylabel("Exposure (%)")
-
-    plt.ylim(
-        -110,
-        110,
-    )
-
-    plt.grid(
-        True,
-        linestyle="--",
-        alpha=0.4,
-    )
-
+    plt.ylim(-110, 110)
+    plt.grid(True, linestyle="--", alpha=0.4)
     plt.tight_layout()
-
-    os.makedirs(
-        out_dir,
-        exist_ok=True,
-    )
-
-    out_path = os.path.join(
-        out_dir,
-        f"{split}_"
-        f"{name.lower().replace(' ', '_')}"
-        f"_exposure.png",
-    )
-
-    plt.savefig(
-        out_path,
-        dpi=150,
-    )
-
+    plt.savefig(os.path.join(out_dir, f"{split}_{slug(name)}_exposure.png"), dpi=150)
     plt.close()
 
-    print(
-        f"  Saved exposure chart: "
-        f"{out_path}"
-    )
+
+def plot_comparison(frames, split, out_dir):
+    plt.figure(figsize=(11, 5))
+    for name, frame in frames.items():
+        plt.plot(pd.to_datetime(frame["date"]), frame["portfolio_value"], label=name, linewidth=1.6)
+    plt.title(f"Equity Curve Comparison ({split} split)")
+    plt.xlabel("Date")
+    plt.ylabel("Portfolio Value")
+    plt.legend()
+    plt.grid(True, linestyle="--", alpha=0.4)
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, f"{split}_equity_comparison.png"), dpi=150)
+    plt.close()
 
 
-def print_report(
-    name,
-    portfolio_history,
-    action_counts,
-    risk_overrides=0,
-):
-    metrics = compute_all_metrics(
-        portfolio_history
-    )
+def write_run_record(path, record):
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(json_safe(record), handle, indent=4)
 
-    dist = action_distribution_pct(
-        action_counts
-    )
 
-    logger = QuantRLLogger(
-        agent_name=name,
-        asset_symbol="",
-    )
+def append_log(out_dir, row):
+    path = os.path.join(out_dir, "evaluation_log.csv")
+    pd.DataFrame([row]).to_csv(path, mode="a", header=not os.path.exists(path), index=False)
 
-    logger.print_evaluation_report(
-        name,
-        metrics,
-        dist,
-        portfolio_history[-1],
-    )
 
-    vol = annualized_volatility(
-        portfolio_history
-    )
+# Command-line 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Evaluate trading agents on a held-out split.")
+    parser.add_argument("--agent", default="all",
+                        choices=["muzero", "ppo", "sma", "buy_and_hold", "cash", "all"],
+                        help="'all' = baselines plus every agent whose checkpoint you pass.")
+    parser.add_argument("--split", choices=["val", "test"], default="val")
+    parser.add_argument("--muzero-ckpt", default=None)
+    parser.add_argument("--ppo-ckpt", default=None)
+    parser.add_argument("--sma-window", type=int, default=SMA_WINDOW)
+    parser.add_argument("--max-drawdown", type=float, default=None,
+                        help="Optional RiskManager kill-switch for MuZero/PPO, e.g. 0.15.")
+    parser.add_argument("--cooldown-steps", type=int, default=5)
+    parser.add_argument("--out-dir", default=DEFAULT_OUT_DIR)
+    parser.add_argument("--no-plots", action="store_true")
+    args = parser.parse_args()
 
-    worst_day = worst_single_period_loss(
-        portfolio_history
-    )
+    if args.agent == "muzero" and not args.muzero_ckpt:
+        parser.error("--muzero-ckpt is required with --agent muzero")
+    if args.agent == "ppo" and not args.ppo_ckpt:
+        parser.error("--ppo-ckpt is required with --agent ppo")
+    return args
 
-    print(
-        f"  Annualised Volatility : {vol:.2%}"
-    )
 
-    print(
-        f"  Worst Single-Step Loss: {worst_day:.2%}"
-    )
+def resolve_agents(args):
+    if args.agent != "all":
+        return [args.agent]
+    agents = []
+    if args.muzero_ckpt:
+        agents.append("muzero")
+    if args.ppo_ckpt:
+        agents.append("ppo")
+    return agents + BASELINES
 
-    if risk_overrides:
-        print(
-            f"  Risk Overrides        : "
-            f"{risk_overrides} steps forced flat"
-        )
 
-    return metrics
+def make_risk_manager(key, args):
+    if args.max_drawdown and key in ("muzero", "ppo"):
+        return RiskManager(max_drawdown=args.max_drawdown, cooldown_steps=args.cooldown_steps)
+    return None
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description=(
-            "Evaluate trading agents on a held-out split."
+    args = parse_args()
+    set_seed(config.SEED)
+    os.makedirs(args.out_dir, exist_ok=True)
+
+    df, data_path = load_split(args.split)
+    data_sha = file_sha256(data_path)
+    agents = resolve_agents(args)
+
+    probe = StockTradingEnv(df, use_dsr=False)
+    print(f"Evaluating on '{args.split}' split: {len(df)} rows, "
+          f"{df['date'].iloc[0]} to {df['date'].iloc[-1]}")
+    print(f"Traded days start at {df['date'].iloc[probe.lookback]} "
+          f"(the first {probe.lookback} rows are lookback only).")
+    print(f"Features ({len(probe.feature_cols)}): {probe.feature_cols}")
+    print(f"Agents: {agents}")
+    if args.split == "test":
+        print("NOTE: test-set run. It will be recorded in evaluation_log.csv.")
+
+    table, frames = {}, {}
+    for key in agents:
+        env = StockTradingEnv(df, use_dsr=False)
+        print(f"\n=== {key} ===")
+        name, action_fn, meta = build_agent(key, env, df, args)
+        result = play_split(env, action_fn, make_risk_manager(key, args))
+        metrics, dist = report(name, result)
+
+        frame = build_equity_frame(df, result)
+        frames[name] = frame
+        table[name] = {k: v for k, v in metrics.items() if k != "rolling_drawdown_series"}
+
+        stem = f"{args.split}_{slug(name)}"
+        frame.to_csv(os.path.join(args.out_dir, f"{stem}_equity.csv"), index=False)
+        if not args.no_plots:
+            plot_exposure(name, frame, args.split, args.out_dir)
+
+        write_run_record(
+            os.path.join(args.out_dir, f"{stem}_run.json"),
+            {
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+                "agent": name,
+                "split": args.split,
+                "data_file": data_path,
+                "data_sha256": data_sha,
+                "rows": len(df),
+                "feature_cols": probe.feature_cols,
+                "obs_shape": list(probe.observation_space.shape),
+                "traded_start": str(frame["date"].iloc[0]),
+                "traded_end": str(frame["date"].iloc[-1]),
+                "traded_steps": len(frame),
+                "risk_overlay_max_drawdown": args.max_drawdown,
+                "action_distribution_pct": dist,
+                "metrics": table[name],
+                "agent_meta": meta,
+            },
         )
-    )
+        append_log(args.out_dir, {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "split": args.split,
+            "agent": name,
+            "checkpoint": meta.get("checkpoint", ""),
+            "data_sha256_12": data_sha[:12],
+            "traded_start": str(frame["date"].iloc[0]),
+            "traded_end": str(frame["date"].iloc[-1]),
+            "total_return": table[name]["total_return"],
+            "sharpe_ratio": table[name]["sharpe_ratio"],
+            "max_drawdown": table[name]["max_drawdown"],
+        })
 
-    parser.add_argument(
-        "--agent",
-        choices=[
-            "muzero",
-            "ppo",
-            "sma",
-            "buy_and_hold",
-            "all",
-        ],
-        default="all",
-    )
+    if len(frames) > 1 and not args.no_plots:
+        plot_comparison(frames, args.split, args.out_dir)
 
-    parser.add_argument(
-        "--split",
-        choices=[
-            "val",
-            "test",
-        ],
-        default="test",
-    )
-
-    parser.add_argument(
-        "--checkpoint",
-        default=None,
-        help=(
-            "Path to a .pth checkpoint. "
-            "Only applied when --agent is muzero "
-            "or ppo specifically."
-        ),
-    )
-
-    parser.add_argument(
-        "--muzero-ckpt",
-        default=None,
-        help="Override MuZero checkpoint path.",
-    )
-
-    parser.add_argument(
-        "--ppo-ckpt",
-        default=None,
-        help="Override PPO checkpoint path.",
-    )
-
-    parser.add_argument(
-        "--sma-window",
-        type=int,
-        default=SMA_WINDOW,
-        help=(
-            "SMA lookback window. "
-            f"Default: {SMA_WINDOW}."
-        ),
-    )
-
-    parser.add_argument(
-        "--max-drawdown",
-        type=float,
-        default=None,
-        help=(
-            "Enable RiskManager kill-switch "
-            "overlay, e.g. 0.15 for 15%%. "
-            "Applied to MuZero/PPO only."
-        ),
-    )
-
-    parser.add_argument(
-        "--cooldown-steps",
-        type=int,
-        default=5,
-        help=(
-            "Steps to stay forced-flat after "
-            "a kill-switch trigger."
-        ),
-    )
-
-    args = parser.parse_args()
-
-    df = load_split(
-        args.split
-    )
-
-    print(
-        f"Evaluating on '{args.split}' split "
-        f"({len(df)} rows)."
-    )
-
-    muzero_ckpt = (
-        args.muzero_ckpt
-        or (
-            args.checkpoint
-            if args.agent == "muzero"
-            else None
-        )
-        or find_latest_checkpoint(
-            "muzero_checkpoint"
-        )
-    )
-
-    ppo_ckpt = (
-        args.ppo_ckpt
-        or (
-            args.checkpoint
-            if args.agent == "ppo"
-            else None
-        )
-        or find_latest_checkpoint(
-            "ppo_checkpoint"
-        )
-    )
-
-    results = {}
-    equity_dfs = {}
-
-    # MuZero
-    if args.agent in (
-        "muzero",
-        "all",
-    ):
-
-        mz_risk = (
-            RiskManager(
-                max_drawdown=args.max_drawdown,
-                cooldown_steps=args.cooldown_steps,
-            )
-            if args.max_drawdown
-            else None
-        )
-
-        (
-            history,
-            counts,
-            positions,
-            steps,
-            overrides,
-        ) = evaluate_muzero(
-            df,
-            muzero_ckpt,
-            risk_manager=mz_risk,
-        )
-
-        results["MuZero"] = print_report(
-            "MuZero",
-            history,
-            counts,
-            risk_overrides=overrides,
-        )
-
-        equity_dfs["MuZero"] = (
-            export_equity_and_positions(
-                "MuZero",
-                df,
-                history,
-                positions,
-                steps,
-                args.split,
-            )
-        )
-
-        plot_exposure_over_time(
-            "MuZero",
-            equity_dfs["MuZero"],
-            args.split,
-        )
-
-    # PPO
-    if args.agent in (
-        "ppo",
-        "all",
-    ):
-
-        ppo_risk = (
-            RiskManager(
-                max_drawdown=args.max_drawdown,
-                cooldown_steps=args.cooldown_steps,
-            )
-            if args.max_drawdown
-            else None
-        )
-
-        (
-            history,
-            counts,
-            positions,
-            steps,
-            overrides,
-        ) = evaluate_ppo(
-            df,
-            ppo_ckpt,
-            risk_manager=ppo_risk,
-        )
-
-        results["PPO"] = print_report(
-            "PPO",
-            history,
-            counts,
-            risk_overrides=overrides,
-        )
-
-        equity_dfs["PPO"] = (
-            export_equity_and_positions(
-                "PPO",
-                df,
-                history,
-                positions,
-                steps,
-                args.split,
-            )
-        )
-
-        plot_exposure_over_time(
-            "PPO",
-            equity_dfs["PPO"],
-            args.split,
-        )
-
-    # SMA
-    if args.agent in (
-        "sma",
-        "all",
-    ):
-
-        (
-            history,
-            counts,
-            positions,
-            steps,
-            _,
-        ) = evaluate_sma(
-            df,
-            window=args.sma_window,
-        )
-
-        sma_name = (
-            f"SMA({args.sma_window})"
-        )
-
-        results[sma_name] = print_report(
-            sma_name,
-            history,
-            counts,
-        )
-
-        equity_dfs[sma_name] = (
-            export_equity_and_positions(
-                sma_name,
-                df,
-                history,
-                positions,
-                steps,
-                args.split,
-            )
-        )
-
-        plot_exposure_over_time(
-            sma_name,
-            equity_dfs[sma_name],
-            args.split,
-        )
-
-    # Buy & Hold
-    if args.agent in (
-        "buy_and_hold",
-        "all",
-    ):
-
-        (
-            history,
-            counts,
-            positions,
-            steps,
-            _,
-        ) = evaluate_buy_and_hold(
-            df
-        )
-
-        results["Buy-and-Hold"] = (
-            print_report(
-                "Buy-and-Hold",
-                history,
-                counts,
-            )
-        )
-
-        equity_dfs["Buy-and-Hold"] = (
-            export_equity_and_positions(
-                "Buy-and-Hold",
-                df,
-                history,
-                positions,
-                steps,
-                args.split,
-            )
-        )
- 
-    # Comparison chart
-    if len(equity_dfs) > 1:
-        plot_equity_comparison(
-            equity_dfs,
-            args.split,
-        )
-
-    # Save results
-    out_dir = os.path.join(
-        "logs",
-        "evaluation",
-    )
-
-    os.makedirs(
-        out_dir,
-        exist_ok=True,
-    )
-
-    out_path = os.path.join(
-        out_dir,
-        f"{args.split}_results.csv",
-    )
-
-    pd.DataFrame(
-        results
-    ).T.to_csv(
-        out_path
-    )
-
-    print(
-        f"\nSaved results to {out_path}"
-    )
+    out_path = os.path.join(args.out_dir, f"{args.split}_results_{args.agent}.csv")
+    pd.DataFrame(table).T.to_csv(out_path)
+    print(f"\nSaved results to {out_path}")
 
 
 if __name__ == "__main__":

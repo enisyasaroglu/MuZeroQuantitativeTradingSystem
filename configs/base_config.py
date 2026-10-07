@@ -4,8 +4,8 @@ from dataclasses import dataclass
 class ProjectConfig:
     # Data Settings
     TICKER: str = "SPY"     # S&P 500
-    START_DATE: str = "2015-01-01"
-    END_DATE: str = "2023-01-01"
+    START_DATE: str = "2010-01-01"
+    END_DATE: str = "2026-01-01"
 
     # Chronological three-way split. TRAIN_SPLIT + VAL_SPLIT must be < 1.0;
     # the remainder is TEST. EMBARGO_DAYS rows are dropped at each split
