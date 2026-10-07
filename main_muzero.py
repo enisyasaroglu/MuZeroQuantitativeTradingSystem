@@ -2,7 +2,11 @@ import os
 import pandas as pd
 import torch
 import random
+import argparse
+import json
+import hashlib
 
+from dataclasses import asdict, replace
 from configs.base_config import ProjectConfig
 from configs.muzero_config import MuZeroConfig
 from src.env.trading_env import StockTradingEnv
@@ -12,9 +16,15 @@ from src.utils.schedules import temperature_schedule
 from utils.dashboard_logger import QuantRLLogger
 
 
-
-def run_muzero():
+def run_muzero(num_episodes=None, num_simulations=None, run_dir="checkpoints"):
     config = MuZeroConfig()
+    overrides = {}
+    if num_episodes is not None:
+        overrides["num_episodes"] = num_episodes
+    if num_simulations is not None:
+        overrides["num_simulations"] = num_simulations
+    if overrides:
+        config = replace(config, **overrides)
     project_config = ProjectConfig()
     
     data_path = os.path.join('data', 'processed', 'train_data.csv')
@@ -22,6 +32,8 @@ def run_muzero():
         print("Data not found!")
         return
     df = pd.read_csv(data_path)
+    with open(data_path, 'rb') as handle:
+        data_sha256 = hashlib.sha256(handle.read()).hexdigest()
     
     env = StockTradingEnv(
         df, 
@@ -37,10 +49,10 @@ def run_muzero():
         batch_size=config.batch_size, 
         unroll_steps=config.unroll_steps,
         discount=config.discount_factor,
-        td_steps=config.unroll_steps
+        td_steps=config.td_steps
     )
     
-    num_episodes = 500
+    num_episodes = config.num_episodes
 
     logger = QuantRLLogger(
         agent_name="MuZero",
@@ -126,13 +138,23 @@ def run_muzero():
         )
         
         if episode % 5 == 0:
-            save_path = os.path.join('checkpoints', f'muzero_checkpoint_{episode}.pth')
-            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            os.makedirs(run_dir, exist_ok=True)
+            save_path = os.path.join(run_dir, f'muzero_checkpoint_{episode}.pth')
             torch.save(agent.network.state_dict(), save_path)
+            with open(save_path.replace('.pth', '_config.json'), 'w') as f:
+                    json.dump({'episode': episode, 'data_sha256': data_sha256,
+                           'feature_cols': list(env.feature_cols), **asdict(config)}, f, indent=4)
 
     logger.stop_dashboard()
 
 if __name__ == "__main__":
-    config = MuZeroConfig()
-    project_config = ProjectConfig()
-    run_muzero()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--episodes", type=int, default=None)
+    parser.add_argument("--simulations", type=int, default=None)
+    parser.add_argument("--run-dir", default="checkpoints")
+    args = parser.parse_args()
+    run_muzero(
+        num_episodes=args.episodes,
+        num_simulations=args.simulations,
+        run_dir=args.run_dir,
+    )
