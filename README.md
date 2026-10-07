@@ -1,160 +1,153 @@
-# MuZero-Inspired Quantitative Trading Agent
+# MuZero-Style Trading Agent
 
-A model-based reinforcement learning trading agent that adapts DeepMind's **MuZero** architecture — built for perfect-information games like Chess and Go — to the imperfect, stochastic world of financial markets.
+A research project that asks a simple question: can an agent that plans ahead trade better than one that only reacts?
 
-> **Project Overview:** 
-Standard RL trading agents (PPO, DQN) react to the market but can't "plan ahead." Planning algorithms like AlphaZero *can* look ahead, but only because they assume access to a perfect simulator of what happens next — something that doesn't exist in finance. This project builds a MuZero agent that **learns its own internal model of market dynamics** and plans inside that learned model using a custom **Open-Loop Monte Carlo Tree Search**, adapted specifically to handle the fact that one trading action can lead to many different possible future outcomes, not one.
+I built it as my final-year project at the University of Greenwich. It adapts DeepMind's MuZero to daily SPY trading and compares it with a PPO baseline and three simple benchmarks. The project is still being developed, and this page tries to be clear about what works, what is being redone, and what I don't know yet.
 
----
+## Project status
 
-## Technical Challenges & Solutions
+I found and fixed two bugs in the planning code in October 2026:
 
-| Problem | Standard approach fails because... | This project's answer |
+- The tree search ignored the immediate reward when choosing between actions.
+- The value targets used only the next five rewards and left out the bootstrap term.
+
+All models trained before these fixes are out of date, and the tests that caught the bugs now pass. I am retraining and rebuilding the evaluation so that every result can be traced to a configuration, a data file and a checkpoint. Results from the earlier version of this work cannot currently be reproduced from this repository, so I don't quote them here.
+
+## What the project explores
+
+A reactive agent (PPO) maps what it sees today to an action. A planning agent (MuZero) first learns a small model of how the market moves, then uses that model to imagine what each action might lead to before choosing one.
+
+Board games give MuZero a clean setting. Markets don't, because prices are noisy and the rules change. So the interesting question is whether planning helps at all in this setting, and the honest answer will include cases where it doesn't.
+
+## How it works
+
+```
+Yahoo Finance data -> features and splits -> trading environment -> agent -> evaluation
+```
+
+**Data.** Daily SPY prices from Yahoo Finance, January 2010 to December 2025. Training uses 2010 to March 2021, validation uses June 2021 to October 2023, and test uses January 2024 to December 2025, with a 60-day gap between splits. The first 60 rows of each split serve only as lookback, so trading starts a little later.
+
+**Environment.** The agent sees the previous 60 days and chooses Short, Neutral or Long. It earns that position multiplied by the next day's return, minus a 0.1% fee for each unit of position change. Switching from Short to Long therefore costs 0.2%. The agent decides after one close and earns the following day's move, but trades at the same close it just observed, which assumes a market-on-close order.
+
+**MuZero agent.** Three networks work together: one encodes the last 60 days into a latent state, one predicts the next state and reward for a chosen action, and one outputs a policy and a value. A tree search over the learned model scores each action as its predicted reward plus the discounted value of where it leads.
+
+**PPO baseline.** A standard actor-critic agent with its own LSTM encoder, trained in the same environment.
+
+**Benchmarks.** Buy-and-hold, always-cash, and a 50-day moving average (long when the previous close was above its average).
+
+## Guarding against look-ahead bias
+
+Backtests are easy to get wrong in ways that flatter the results, so these are the safeguards in place:
+
+- Splits are chronological, with a 60-day gap between them.
+- Normalisation statistics come from the training split only.
+- Indicators measured in price units are divided by the close, so they stay on the same scale as the index rises.
+- The observation window ends the day before the return it is paid on.
+
+Still to add: a test that proves features at time *t* don't change when later data is appended, and saving the normalisation statistics alongside each model.
+
+## Training and evaluation
+
+Each training episode is a random 252-day window of the training data, played with exploration switched on. Training uses raw net returns as the reward. A Differential Sharpe Ratio reward is implemented and tested, but the current runs don't use it.
+
+Evaluation plays a full split in order with exploration off: MuZero with temperature 0, PPO taking its most likely action. Each run records the dates traded, the data and checkpoint fingerprints, and the configuration used, and every evaluation is appended to `logs/evaluation/evaluation_log.csv`. The validation split is for choosing models, and the test split is reported once.
+
+## Results
+
+I'm not publishing numbers yet. Three things need to happen first: a full retraining with the fixed code on the 2010 to 2025 data, several random seeds, and one clean evaluation of the test split on a model chosen beforehand using validation only.
+
+One finding worth recording: earlier checkpoints, trained before the search fix, held cash on every single day when evaluated. The retraining is testing whether that behaviour was caused by the bugs or whether a cash-only policy is simply what the agent learns when the market offers little to exploit.
+
+## Feature status
+
+| Area | Status | Notes |
 |---|---|---|
-| No known "rules" for how prices move | AlphaZero requires a perfect simulator (game rules) | MuZero learns an approximate dynamics model instead |
-| Price transitions are random, not deterministic | Standard MCTS assumes one action → one exact next state | Open-Loop MCTS: tree nodes represent *action sequences*, not states |
-| Historical data can leak into the future | Naive train/test splits and indicator computation leak information | 60-day embargo gaps, per-split indicator computation, train-only normalisation |
-| Raw returns reward reckless risk-taking | Optimising for profit alone encourages excessive volatility | Differential Sharpe Ratio used as a dense, risk-adjusted reward signal |
-
----
-
-## Headline Results (Out-of-Sample Test Set, 2023–2024)
-
-| Agent | Total Return | Sharpe Ratio | Max Drawdown |
-|---|---|---|---|
-| **MuZero** | -9.95% | -0.88 | -20.6% |
-| PPO (baseline) | -25.21% | -2.60 | -26.0% |
-| Buy-and-Hold | +27.10% | +1.89 | -8.4% |
-
-**MuZero consistently outperformed the PPO baseline** across both out-of-sample evaluation periods (+29.5 pts validation, +15.3 pts test). **Neither RL agent beat passive Buy-and-Hold** during the exceptionally strong 2023–2024 bull market — MuZero had correctly learned a defensive, short-biased strategy during the 2022 bear market and failed to "unlearn" that bias once the regime shifted. This is documented and analysed as a finding, not hidden as a failure, see [Limitations](#limitations).
-
----
-
-## Architecture
-
-Six-layer system: **Data Pipeline → Trading Environment → Shared Networks → Agents (MuZero / PPO) → Training Loop → Evaluation**.
-
-- **Representation Network** — 2-layer LSTM, encodes a 60-day lookback window into a 64-dim latent state
-- **Dynamics Network** — the learned "world model"; predicts next latent state + reward from a hidden state and action
-- **Prediction Network** — policy + value heads over the latent state
-- **Open-Loop MCTS** — UCB-based tree search over action sequences, using the exact constants (`pb_c_base=19652`, `pb_c_init=1.25`) from Schrittwieser et al. (2020)
-- **PPO baseline** — identical LSTM encoder to MuZero, so the *only* experimental variable is the presence of planning
-
----
-
-## Engineering highlights
-
-This wasn't just "run the algorithm and report numbers." Three environment bugs and one training-loop bug were found and fixed via a 10-file test suite during development:
-
-- **Portfolio reset bug** — episodes were silently inheriting the previous episode's ending capital, corrupting validation comparisons (one checkpoint showed a false "£13.91" near-total-loss result caused entirely by this bug).
-- **Reward signal double-counted** — the Differential Sharpe Ratio's internal EMA state was being advanced twice per step, corrupting the reward signal from step one of every episode.
-- **Off-by-one reward misalignment** in the MuZero unrolled training loss — the reward head was being trained to predict the *next* step's reward instead of the current transition's, caught by isolating the reward-loss curve during integration testing.
-
-Each of these is covered by a regression test in `tests/` (see `test_env.py::test_environment_reset`, `test_dsr.py::test_single_call_per_step_is_deterministic`, `test_muzero_update.py::test_reward_target_alignment`) so they cannot be silently reintroduced.
-
----
-
-## Tech Stack
-
-`Python` · `PyTorch` · `Gymnasium` · `yfinance` · `stockstats` · `NumPy` / `Pandas` · `Matplotlib`
-
----
-
-## Repository Structure
-
-```
-├── configs/
-│   ├── base_config.py         # Shared hyperparameters, data split, DSR, tech indicators
-│   └── muzero_config.py       # MuZero-specific settings (network, MCTS, unrolled loss)
-├── data/
-│   ├── raw/                   # Raw market data (OHLCV) - gitignored, fetched on demand
-│   └── processed/             # train/val/test_data.csv - gitignored, generated by processor.py
-├── src/
-│   ├── pipeline/
-│   │   ├── fetcher.py         # Yahoo Finance data fetching
-│   │   └── processor.py       # Cleaning, log-returns, embargoed split, indicators, normalisation
-│   ├── env/
-│   │   ├── trading_env.py     # Gymnasium-compatible trading environment
-│   │   └── rewards.py         # Differential Sharpe Ratio reward
-│   ├── networks/
-│   │   ├── representation.py  # State encoder (LSTM, tanh-bounded output)
-│   │   ├── dynamics.py        # Learned transition model g(s, a) -> (s', r)
-│   │   ├── prediction.py      # Policy + value heads (ELU)
-│   │   ├── ppo_networks.py    # PPO actor-critic network
-│   │   └── shared.py          # MLP / TimeSeriesEncoder building blocks
-│   ├── agents/
-│   │   ├── muzero/
-│   │   │   ├── mcts.py        # Open-Loop MCTS: Node, UCB, backpropagation
-│   │   │   └── muzero_agent.py# select_action (planning) + update (unrolled training loss)
-│   │   └── baselines/
-│   │       └── ppo_agent.py   # PPO agent (GAE-free MC-return variant)
-│   └── utils/
-│       ├── metrics.py         # Sharpe, Sortino, Calmar, drawdown, CAGR, win rate
-│       └── replay_buffer.py   # Experience storage for MuZero's unrolled training
-├── logs/
-│   └── evaluation/            # evaluate.py output (gitignored)
-├── notebooks/                 # EDA + sanity checks
-├── tests/                     # 29 tests across 8 files - see Testing below
-├── main_muzero.py             # MuZero training entry point
-├── main_ppo.py                # PPO baseline training entry point
-├── evaluate.py                # Evaluation script (metrics + action distribution)
-├── README.md
-└── requirements.txt
-```
-
----
+| Data pipeline | Implemented, tested | Leakage tests being strengthened |
+| Single-asset environment | Implemented, tested | |
+| Differential Sharpe reward | Implemented, tested | Not used in current runs |
+| MuZero agent | Implemented, tested | Retraining after the October fixes |
+| PPO baseline | Implemented, lightly tested | Window-end handling to be fixed |
+| Evaluation and benchmarks | Implemented | Rewritten in October |
+| Multi-asset environment | Experimental | No evaluation path yet |
+| Portfolio optimisation methods | Implemented, tested | Not yet reviewed |
+| Risk manager | Partial | |
+| Regime detection | Experimental | |
+| Backtesting | Partial | Cost models only so far |
+| Order execution and brokers | Placeholder | |
+| Docker and Terraform | Not yet reviewed | |
 
 ## Quickstart
 
 ```bash
 pip install -r requirements.txt
-python src/pipeline/data_fetcher.py --multi-asset   # fetch multiple assets
-python src/pipeline/processor.py                    # fetch + process data -> data/processed/{train,val,test}_data.csv
-python main_ppo.py                                  # train PPO baseline (checkpoints -> src/models/)
-python main_muzero.py                               # train MuZero
-python evaluate.py --agent all --split test         # evaluate all agents, save metrics to logs/evaluation/
-pytest tests/                                       # run the full test suite (29 tests)
+
+# 1. Download data and build the train, validation and test files
+python3 src/pipeline/processor.py
+
+# 2. Train. Each run writes its models and a configuration record to its folder.
+python3 main_muzero.py --run-dir runs/muzero_001
+python3 main_ppo.py --run-dir runs/ppo_001
+
+# 3. Evaluate on the validation split (baselines are always included)
+python3 evaluate.py --agent all --split val \
+    --muzero-ckpt runs/muzero_001/muzero_checkpoint_500.pth \
+    --ppo-ckpt runs/ppo_001/ppo_final.pth
+
+# 4. Run the tests
+pytest
+```
+
+A quick check that everything runs: `python3 main_muzero.py --episodes 12 --simulations 20 --run-dir runs/smoke_test`.
+
+## Repository layout
+
+```
+configs/      Settings for data, MuZero and PPO
+src/pipeline/ Data download, validation, features and splits
+src/env/      Trading environments and the Differential Sharpe reward
+src/networks/ Neural network building blocks
+src/agents/   MuZero (search and training) and PPO
+src/utils/    Metrics, replay buffer, logging
+src/portfolio, src/risk, src/regime, src/strategies, src/backtesting
+              Portfolio, risk, regime and benchmark modules
+tests/        Automated tests
+notebooks/    Exploration and sanity checks
 ```
 
 ## Testing
 
-29 tests across 8 files, covering the reward function, environment mechanics, MCTS invariants,
-network shapes, training update mechanics, the data pipeline, and financial metrics. All tests
-use synthetic fixtures generated in-test — no external data download or pre-existing checkpoint
-is required to run the suite.
-
-```bash
-pytest tests/ -v
-```
-
----
+150 tests run in a few seconds and use synthetic data, so no download or trained model is needed. They cover the environment, the reward, search mechanics, the replay buffer, the metrics and the portfolio methods. Two of the most useful ones check that the search prefers an action with a higher immediate reward and that value targets add the correct bootstrap term. Both failed before the October fixes.
 
 ## Limitations
 
-- **Single asset (SPY), single train/val/test split, single random seed.** The MuZero > PPO result is directionally consistent with the architecture's expected behaviour but is **not yet a statistically validated claim** — see Roadmap.
-- **MCTS simulation budget of 50/step**, vs. 800 in the original MuZero paper — a single-CPU compute constraint, not a design choice.
-- **Flat 0.1% transaction cost**, no slippage or market impact modelling.
-- **No online regime detection** — the agent's biggest documented failure mode.
+- One asset, one data window, one random seed so far. Differences between agents are not statistically meaningful until this changes.
+- The validation and test windows are each about two years long, so a Sharpe ratio measured on either is still uncertain by roughly 0.7 to 0.8.
+- Costs are a flat 0.1% per unit of position change, with no slippage, no cost for borrowing shares to short, and no interest on cash.
+- The search uses 150 simulations per decision, far fewer than the original MuZero paper's 800.
+- The PPO baseline isn't compute-matched to MuZero, so comparisons between them need care.
+- Daily data and same-close execution suit research. They are not a model of live trading.
 
 ## Roadmap
 
-- [ ] Multi-seed training with confidence intervals across multiple non-overlapping historical windows
-- [ ] Regime-detection layer (HMM over latent states) to address the short-bias hysteresis problem
-- [ ] Multi-asset portfolio extension — continuous position weights across SPY, QQQ, GLD, individual equities
-- [ ] Realistic transaction cost model (slippage, market impact)
-- [ ] Paper-trading integration via a broker API for live-data validation
-- [ ] Cloud GPU scaling to raise MCTS simulation budget toward the original paper's 800/step
+Roughly in order:
 
-## Related Project
+1. Retrain with the fixed code. Run several seeds, with validation-based model selection.
+2. Report confidence intervals for every result.
+3. Strengthen the leakage tests and save normalisation statistics with each model.
+4. Handle window ends correctly in PPO.
+5. A full backtesting engine with richer transaction costs.
+6. Regime detection and multi-asset portfolios.
 
-[**Swarm Intelligence for Portfolio Optimisation**](../swarm-intelligence): a companion mini-project applying Particle Swarm Optimisation to constrained Markowitz portfolio selection. The natural next step connecting both projects: use PSO (or a learned allocator) to size positions **across assets**, while MuZero decides direction **within** each asset — see Roadmap above.
+## Companion project
+
+A second project applies swarm optimisation algorithms to constrained portfolio selection. It lives in its own repository and is the natural partner to this one: this project decides direction for one asset, and that one decides how to split capital across assets.
 
 ## References
 
-Schrittwieser et al. (2020), *Mastering Atari, Go, chess and shogi by planning with a learned model*, Nature.
-Vittori et al. (2021), *Monte Carlo Tree Search for Trading and Hedging*, ICAIF '21.
-Full bibliography in the accompanying dissertation.
+- Schrittwieser et al. (2020), Mastering Atari, Go, chess and shogi by planning with a learned model, Nature.
+- Moody and Wu (1997), Optimization of trading systems and portfolios.
+- Vittori et al. (2021), Monte Carlo Tree Search for Trading and Hedging, ICAIF.
 
 ## License
 
-MIT# MuZeroQuantitativeTradingSystem
+MIT

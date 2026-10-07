@@ -23,6 +23,7 @@ logs/tensorboard/
 logs/evaluation/*.csv
 logs/evaluation/*.png
 logs/evaluation/*.json
+!logs/evaluation/evaluation_log.csv
 
 # OS
 .DS_Store
@@ -33,3 +34,4 @@ logs/evaluation/*.json
 
 # Other
 knowledge/
+runs/
