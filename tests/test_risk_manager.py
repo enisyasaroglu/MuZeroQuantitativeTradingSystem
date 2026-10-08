@@ -77,3 +77,18 @@ def test_filter_action_before_reset_raises():
         assert False, "expected RuntimeError"
     except RuntimeError:
         pass
+    
+def test_kill_switch_does_not_relatch_after_cooldown_when_flat():
+    """While the portfolio is flat its value cannot rise, so the drawdown
+    stays the same. After the cooldown the agent must get a fresh start
+    and not be forced flat again immediately."""
+    rm = RiskManager(max_drawdown=0.20, cooldown_steps=3)
+    rm.reset(initial_value=100_000.0)
+
+    rm.filter_action(proposed_action=2, current_portfolio_value=80_000.0)  # triggers
+    for _ in range(3):
+        rm.filter_action(proposed_action=2, current_portfolio_value=80_000.0)  # cooldown
+
+    action = rm.filter_action(proposed_action=2, current_portfolio_value=80_000.0)
+    assert action == 2
+    assert rm.triggered_count == 1

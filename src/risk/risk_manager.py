@@ -94,6 +94,11 @@ class RiskManager:
         if drawdown <= -self.max_drawdown:
             self._triggered_count += 1
             self._cooldown_remaining = self.cooldown_steps
+            # Restart the drawdown measurement from the current value, so
+            # the agent gets a fresh start once the cooldown has ended.
+            # Without this, a flat portfolio would stay below its old peak
+            # for ever and the switch would fire again at once.
+            self._peak_value = current_portfolio_value
             return self.NEUTRAL_ACTION
 
         return proposed_action
