@@ -13,12 +13,15 @@ data, the environment and the learning code, separate from the real market:
   the learning code works, and any failure on real prices means the
   market data holds little to learn.
 
+This file holds the fast checks and the PPO learning test. The MuZero
+learning test is in tests/test_sin_wave_muzero.py.
+
 The data is built in memory. Nothing is read from or written to disk.
 
-The slow test trains an agent for several minutes. It runs only when the
-environment variable RUN_SLOW_TESTS is set to 1:
+The PPO learning test trains an agent for a few minutes. It runs only when
+the environment variable RUN_SLOW_TESTS is set to 1:
 
-    RUN_SLOW_TESTS=1 pytest tests/test_sin_wave.py -v -s -k learns
+    RUN_SLOW_TESTS=1 pytest tests/test_sin_wave.py -v -s -k ppo_learns
 """
 
 import os
@@ -131,7 +134,7 @@ def test_oracle_earns_far_more_than_buy_and_hold():
 
 @pytest.mark.skipif(
     os.environ.get("RUN_SLOW_TESTS") != "1",
-    reason="Slow test (several minutes). Set RUN_SLOW_TESTS=1 to run it.",
+    reason="Slow test (a few minutes). Set RUN_SLOW_TESTS=1 to run it.",
 )
 def test_ppo_learns_the_sine_rule():
     """A PPO agent trained on the first part of the sine series should earn
@@ -180,11 +183,15 @@ def test_ppo_learns_the_sine_rule():
             agent.update(memory)
             memory = {k: [] for k in memory}
 
+    chosen = []
+
+    def trained_action(obs):
+        action = agent.select_action(obs, deterministic=True)[0]
+        chosen.append(action)
+        return action
+
     eval_env = StockTradingEnv(eval_df, use_dsr=False)
-    history = play(
-        eval_env,
-        lambda obs: agent.select_action(obs, deterministic=True)[0],
-    )
+    history = play(eval_env, trained_action)
     agent_return = history[-1] / history[0] - 1.0
 
     hold_env = StockTradingEnv(eval_df, use_dsr=False)
@@ -192,6 +199,7 @@ def test_ppo_learns_the_sine_rule():
     hold_return = hold_history[-1] / hold_history[0] - 1.0
 
     print(f"PPO return {agent_return:+.2%}, buy-and-hold {hold_return:+.2%}")
+    print("action counts short/neutral/long:", np.bincount(chosen, minlength=3).tolist())
     assert agent_return > 0.25, (
         f"PPO earned {agent_return:+.2%} against buy-and-hold "
         f"{hold_return:+.2%}; it did not learn the sine rule."
