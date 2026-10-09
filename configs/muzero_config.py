@@ -49,6 +49,11 @@ class MuZeroConfig:
     # Training
     num_episodes: int = 500
     updates_per_episode: int = 10
+    
+    # Rewards are multiplied by this factor for training only. Raw daily
+    # returns are about 0.01, too small for the reward and value heads
+    # to learn from, so they are scaled up. Evaluation uses true returns.
+    reward_scale: float = 100.0
 
     # Gradient control
     hidden_state_grad_scale: float = 0.5

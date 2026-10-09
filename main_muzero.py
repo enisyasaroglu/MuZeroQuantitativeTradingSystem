@@ -87,7 +87,7 @@ def run_muzero(num_episodes=None, num_simulations=None, run_dir="checkpoints"):
             
             game_history['obs'].append(obs)
             game_history['actions'].append(action)
-            game_history['rewards'].append(reward)
+            game_history['rewards'].append(reward * config.reward_scale)  # Scale rewards to avoid numerical issues
             game_history['policies'].append(policy)
             game_history['values'].append(value)
             

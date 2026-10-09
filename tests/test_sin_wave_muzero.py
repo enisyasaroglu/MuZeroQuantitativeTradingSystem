@@ -39,6 +39,7 @@ from src.utils.schedules import temperature_schedule
 PERIOD = 20
 AMPLITUDE = 0.05
 N_ROWS = 1500
+REWARD_SCALE = float(os.environ.get("MUZERO_REWARD_SCALE", "100"))
 
 
 def make_sine_df(n=N_ROWS, period=PERIOD, amplitude=AMPLITUDE):
@@ -127,7 +128,7 @@ def test_muzero_learns_the_sine_rule():
             done = terminated or truncated
             game["obs"].append(obs)
             game["actions"].append(action)
-            game["rewards"].append(reward)
+            game["rewards"].append(reward* REWARD_SCALE)  # Scale rewards to avoid numerical issues 
             game["policies"].append(policy)
             game["values"].append(value)
             obs = next_obs
