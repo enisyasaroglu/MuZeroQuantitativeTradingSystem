@@ -92,12 +92,13 @@ def _run_single_backtest(returns_matrix: np.ndarray, optimizer, constraints: Por
         turnover = portfolio.turnover(target_weights)
         turnovers.append(turnover)
 
-        asset_returns = returns_matrix[t]
-        gross_return = float(target_weights @ asset_returns)
+        simple_asset_returns = np.exp(returns_matrix[t]) - 1.0
+        gross_return = float(target_weights @ simple_asset_returns)
         cost = transaction_fee * turnover
-        net_return = gross_return - cost
+        net_return = max(gross_return - cost, -0.99)
 
-        portfolio_value *= np.exp(net_return)
+        portfolio_value *= 1.0 + net_return
+
         portfolio_history.append(portfolio_value)
         portfolio.commit(target_weights)
 

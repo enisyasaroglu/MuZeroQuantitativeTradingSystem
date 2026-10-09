@@ -88,12 +88,14 @@ class Portfolio:
         self.current_weights = np.zeros(n_assets)
         self._cached_target = None
         self.last_result: Optional[OptimizationResult] = None
+        self._last_solve_step = None
 
     def reset(self):
         """Call once per episode, alongside env.reset()."""
         self.current_weights = np.zeros(self.n_assets)
         self._cached_target = None
         self.last_result = None
+        self._last_solve_step = None
 
     def propose_weights(self, t: int, returns_matrix: np.ndarray) -> np.ndarray:
         """
@@ -112,7 +114,7 @@ class Portfolio:
 
         should_rebalance = (
             self._cached_target is None
-            or (t - self.lookback) % self.rebalance_every == 0
+            or t - self._last_solve_step >= self.rebalance_every
         )
         if should_rebalance:
             window = returns_matrix[t - self.lookback : t]
@@ -124,6 +126,7 @@ class Portfolio:
             result = self.optimizer.optimize(inputs, self.constraints)
             self._cached_target = result.weights
             self.last_result = result
+            self._last_solve_step = t
 
         return self._cached_target
 

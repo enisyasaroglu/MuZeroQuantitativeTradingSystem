@@ -141,10 +141,14 @@ class MultiAssetTradingEnv(gym.Env):
 
     def step(self, action):
         window_end = getattr(self, '_window_end', self.n_dates)
-        terminated = self.current_step >= window_end - 1
-        if terminated:
-            return self._get_observation(), 0.0, True, False, {'portfolio_value': self.portfolio_value}
-
+        out_of_time = self.current_step >= window_end - 1
+        if out_of_time:
+            return self._get_observation(), 0.0, False, True, {
+                'portfolio_value': self.portfolio_value,
+                'net_return': 0.0,
+                'weights': self.current_weights,
+            }
+            
         target_weights = self._get_action_weights(int(action), self.current_step)
         asset_log_returns = self.raw_returns[self.current_step]  # (n_assets,)
 
@@ -177,7 +181,7 @@ class MultiAssetTradingEnv(gym.Env):
         self.portfolio.commit(target_weights)
         self.current_step += 1
 
-        return self._get_observation(), float(reward), terminated, False, {
+        return self._get_observation(), float(reward), False, False, {
             'portfolio_value': self.portfolio_value,
             'net_return': net_log_return,
             'weights': target_weights,

@@ -25,8 +25,10 @@ def test_single_backtest_matches_hand_computed_equal_weight_no_cost():
 
     manual_value = 100_000.0
     for t in range(lookback, len(returns) - 1):
-        port_return = np.mean(returns[t])  # equal weight = mean of asset returns
-        manual_value *= np.exp(port_return)
+        # Equal weight: the portfolio's simple return is the average of
+        # the assets' simple returns (each is exp(log return) - 1).
+        port_return = np.mean(np.exp(returns[t]) - 1.0)
+        manual_value *= 1.0 + port_return
 
     assert np.isclose(result["total_return"], (manual_value / 100_000.0) - 1.0, atol=1e-6)
 

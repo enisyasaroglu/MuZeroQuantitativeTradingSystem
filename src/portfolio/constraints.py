@@ -50,7 +50,16 @@ class PortfolioConstraints:
             raise ValueError(f"min_weight ({self.min_weight}) cannot exceed max_weight ({self.max_weight}).")
         if self.max_assets is not None and self.max_assets <= 0:
             raise ValueError("max_assets must be a positive integer when set.")
-
+        if (
+            self.full_investment
+            and self.max_assets is not None
+            and self.max_assets * self.max_weight < 1.0 - 1e-9
+        ):
+            raise ValueError(
+                f"Infeasible constraints: {self.max_assets} assets with a maximum "
+                f"weight of {self.max_weight} can hold at most "
+                f"{self.max_assets * self.max_weight:.2f}, not 100%."
+            )
     def project(self, weights: np.ndarray) -> np.ndarray:
         """Heuristic repair of an arbitrary weight vector into this
         constraint set. See module docstring for what "heuristic" means
